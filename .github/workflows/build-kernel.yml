@@ -238,6 +238,17 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload training vmlinux
+        run: cp "kernel_workspace/profiler-cache/$DEVICE/vmlinux" "kernel_workspace/profiler-cache/$DEVICE/${DEVICE}-vmlinux"
+
+      - name: Publish training vmlinux artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.DEVICE }}-vmlinux
+          path: kernel_workspace/profiler-cache/${{ env.DEVICE }}/${{ env.DEVICE }}-vmlinux
+          if-no-files-found: error
+          retention-days: 30
+
   # -------------------------------------------------------------------------
   # 4. Production kernels
   # -------------------------------------------------------------------------
@@ -540,6 +551,7 @@ jobs:
             Verify `SHA256SUMS` before flashing.
           files: |
             dist/*.zip
+            dist/*-vmlinux
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           draft: false
