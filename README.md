@@ -1,7 +1,6 @@
 # MT6768 AutoFDO Kernel Builder
 
-Profile-guided optimization (AutoFDO + Propeller) for
-**MT6768** Android kernels.
+Profile-guided optimization (AutoFDO + Propeller) for **MT6768** Android kernels.
 
 > **Status: experimental.** The workflow and documentation are in place; the
 > collection wrappers in `collector/` are still placeholders. Read
@@ -11,16 +10,14 @@ Profile-guided optimization (AutoFDO + Propeller) for
 
 AutoFDO is **sample-based**, not instrumented. A training kernel is built with
 line-table debug info (`-gmlt`), a representative workload is sampled with
-`perf` + ARM SPE, the samples are converted into a `.afdo` profile on the host,
-and that profile is fed back into the compiler for the production build.
+`perf`, the samples are converted into a `.afdo` profile on the host, and that
+profile is fed back into the compiler for the production build.
 
 ```
   profiling kernel              on-device training              profile                production kernel
   ─────────────────             ───────────────────            ─────────                ─────────────────
   CONFIG_LTO_CLANG=n     boot ─┐
-  CONFIG_AUTOFDO_CLANG=y game ─┼─> perf record · ARM SPE ─> create_llvm_prof ─> CONFIG_LTO_CLANG=y
   no .afdo profile       daily─┘        (branch_filter)          (*.afdo)          CONFIG_THINLTO=y
-  CONFIG_..._ARM64_SPE=y                                                             CONFIG_AUTOFDO_CLANG=y
   (+ kpti=off)                                                                       CLANG_AUTOFDO_PROFILE=...
                                                                                      (+ CONFIG_PROPELLER_CLANG=y)
 ```
@@ -33,8 +30,6 @@ and that profile is fed back into the compiler for the production build.
 | `CLANG_AUTOFDO_PROFILE` | unset | `.../mt6768.afdo` |
 | `CONFIG_LTO_CLANG` / `CONFIG_THINLTO` | `n` / `n` | `y` / `y` |
 | `CONFIG_PROPELLER_CLANG` | `n` | optional |
-| `CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE` | `y` | **`n`** |
-| ARM SPE hints (`kpti=off`) | yes (automatic) | no |
 
 Disabling LTO for the training build keeps the build fast and the binary easy to
 match against samples; the resulting profile is still valid input for a ThinLTO
@@ -52,7 +47,6 @@ NoMount from the setup URLs in `build.env`, generates the configuration, builds
 the kernel, and creates an AnyKernel3 zip.
 
 ```sh
-# Build the training kernel. It enables SPE and disables LTO.
 ./build.sh --stage profiler --device selene
 
 # Build the optimized kernel from an AFDO profile.
@@ -71,7 +65,6 @@ create_llvm_prof --version          # google/autofdo >= v0.30.1
 # 1) Build the profiling kernel
 make O=out ARCH=arm64 vendor/mt6768_defconfig
 python3 helpers/cc.py CONFIG_LTO_CLANG=n CONFIG_THINLTO=n \
-        CONFIG_AUTOFDO_CLANG=y CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y
 make O=out ARCH=arm64 -j"$(nproc)" LLVM=1 LLVM_IAS=1 \
         CROSS_COMPILE=aarch64-linux-gnu- \
         CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -81,14 +74,12 @@ make O=out ARCH=arm64 -j"$(nproc)" LLVM=1 LLVM_IAS=1 \
 # 3) Convert samples into an AutoFDO profile
 create_llvm_prof --binary=out/arch/arm64/boot/vmlinux \
                  --profile=perf-game.data \
-                 --profiler=perf_spe --format=extbinary \
                  --out=profiles/devices/selene/mt6768-game.afdo
 ```
 
 ```sh
 # 4) Build the production kernel
 python3 helpers/cc.py CONFIG_LTO_CLANG=y CONFIG_THINLTO=y \
-        CONFIG_AUTOFDO_CLANG=y CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=n
 make O=out ARCH=arm64 -j"$(nproc)" LLVM=1 LLVM_IAS=1 \
         CROSS_COMPILE=aarch64-linux-gnu- \
         CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
@@ -109,7 +100,6 @@ waits for the training kernel to finish compiling. Only `release` joins them.
 
 | Job | What it does |
 |---|---|
-| `prepare` | Resolves the pinned kernel commit and hashes `build.env`, `build.sh`, the SPE patch and the commit into the profiler cache key. |
 | `profiler` | Builds the training kernel (SPE, LTO off) once per device, packages `*-profiler-*.zip`, stores `vmlinux` + `Image.gz-dtb` + provenance in the cache. **Skipped entirely when the cache key hits.** |
 | `optimized` | Per device: resolves a profile, builds with ThinLTO + AutoFDO, packages `*-autofdo-*.zip`. |
 | `release` | Publishes every zip plus `SHA256SUMS`. |
@@ -145,7 +135,6 @@ Artifacts are per run and kept for 30 days; releases are tagged
 ```
 build.env                  kernel source, device list, toolchain, root solution, packaging
 build.sh                   the two-stage builder (--stage profiler|optimized)
-patches/                   SPE device-tree node (training stage only)
 collector/                 on-device workload wrappers (boot / game / daily) — WIP
 helpers/cc.py              tiny .config editor used by the build steps
 profiles/                  collected profiles, one directory per device
@@ -160,7 +149,6 @@ docs/                      design notes, step-by-step guide, troubleshooting
 | Document | Contents |
 |---|---|
 | [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md) | End-to-end workflow: patch stack, configs, collection, conversion, validation |
-| [`docs/SPE-BRINGUP.md`](docs/SPE-BRINGUP.md) | **Read this first if `arm_spe_0` is missing** — DT node, PPI, hardware check |
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Two-build model, config matrix, profile compatibility rules, known gaps |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Symptom → cause → fix |
 | [`profiles/README.md`](profiles/README.md) | Profile naming, provenance and retention rules |
@@ -179,16 +167,6 @@ provenance clear, not because the profile is device-locked.
 
 ## Known limitations
 
-- **SPE availability is unverified and currently the project's blocker.** Neither
-  the vendor DT nor the LineageOS/mainline MT6768 DTs have an SPE node. No
-  ready-made patch exists — but no driver or PID backport is needed either:
-  `arm_spe_pmu` and `CONFIG_PID_IN_CONTEXTIDR` are already in this 4.19 tree, so
-  the missing piece is a 4-line DT node, carried by
-  `patches/0001-arm64-dts-mt6768-add-arm-spe-node.patch`. `simpleperf list`
-  showing only `armv8_pmuv3` proves nothing (the SPE PMU has no `events/`
-  entries); the only valid test is `arm_spe_0` in
-  `/sys/bus/event_source/devices/` on a training kernel. See
-  [`docs/SPE-BRINGUP.md`](docs/SPE-BRINGUP.md).
 - `collector/*.sh` are empty. Until they land, use the raw `perf` commands from
   [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md).
 - Propeller needs Clang/LLD 19+ and a second profiling round; treat it as a

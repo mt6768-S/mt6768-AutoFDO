@@ -87,7 +87,7 @@ INTEGRATION_FRAGMENT="$KERNEL_DIR/kbuild-integrations.config"
 KERNEL_CONFIG_BASE="${KERNEL_CONFIG_BASE:-vendor/mt6768_defconfig}"
 KERNEL_CONFIG_FRAGMENT_DIR="${KERNEL_CONFIG_FRAGMENT_DIR:-vendor}"
 ENABLE_CCACHE="${ENABLE_CCACHE:-true}"
-APPLY_SPE_PATCH="${APPLY_SPE_PATCH:-true}"
+HAS_SPE="${HAS_SPE:-false}"
 
 KERNEL_ARCH="${KERNEL_ARCH:-arm64}"
 KERNEL_IMAGE_NAME="${KERNEL_IMAGE_NAME:-Image.gz-dtb}"
@@ -188,7 +188,7 @@ apply_spe_patch() {
 	local dts="arch/arm64/boot/dts/mediatek/mt6768.dts"
 	local patch="$REPO_ROOT/patches/0001-arm64-dts-mt6768-add-arm-spe-node.patch"
 	[ "$STAGE" = "profiler" ] || return 0
-	[ "$APPLY_SPE_PATCH" = "true" ] || { warn "SPE DT patch disabled"; return 0; }
+	[ "$HAS_SPE" = "true" ] || { warn "SPE DT patch disabled"; return 0; }
 	[ -f "$patch" ] || die "missing $patch"
 
 	if grep -q 'statistical-profiling-extension-v1' "$KERNEL_DIR/$dts"; then
@@ -253,22 +253,37 @@ gen_config() {
 		"CONFIG_KALLSYMS_ALL=y"
 	)
 
-	# 3) Stage-specific flags.
+	# 3) Stage-specific flags. MT6768 does not have SPE support by default.
 	if [ "$STAGE" = "profiler" ]; then
 		edits+=(
 			"CONFIG_LTO_CLANG=n"
 			"CONFIG_LTO_NONE=y"
 			"CONFIG_THINLTO=n"
 			"CONFIG_CFI_CLANG=n"
+			"CONFIG_PERF_EVENTS=y"
+			"CONFIG_HW_PERF_EVENTS=y"
+			"CONFIG_DEBUG_INFO=y"
+		)
+		[ "$HAS_SPE" = "y" ] && edits+=(
 			"CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y"
 			"CONFIG_ARM_SPE_PMU=y"
 			"CONFIG_PID_IN_CONTEXTIDR=y"
+		) || edits+=(
+			"CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=n"
+			"CONFIG_ARM_SPE_PMU=n"
+			"CONFIG_PID_IN_CONTEXTIDR=n"
 		)
 	else
 		edits+=(
 			"CONFIG_LTO_CLANG=y"
 			"CONFIG_THINLTO=y"
+			"CONFIG_PERF_EVENTS=y"
+			"CONFIG_HW_PERF_EVENTS=y"
+			"CONFIG_DEBUG_INFO=y"
+		)
+		[ "$HAS_SPE" = "y" ] || edits+=(
 			"CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=n"
+			"CONFIG_ARM_SPE_PMU=n"
 			"CONFIG_PID_IN_CONTEXTIDR=n"
 		)
 	fi
@@ -286,7 +301,7 @@ assert_config() {
 	local bad=0 line
 	local cfg="$KERNEL_DIR/out/.config"
 
-	if [ "$STAGE" = "profiler" ]; then
+	if [ "$STAGE" = "profiler" ] && [ "$HAS_SPE" = "y" ]; then
 		cfg_is AUTOFDO_CLANG y                          || { warn "AUTOFDO_CLANG is not y"; bad=1; }
 		cfg_is AUTOFDO_CLANG_PROFILER_ARM64_SPE y       || { warn "SPE helper is not y"; bad=1; }
 		cfg_is ARM_SPE_PMU y                            || { warn "ARM_SPE_PMU is not y"; bad=1; }

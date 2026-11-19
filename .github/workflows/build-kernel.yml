@@ -534,12 +534,8 @@ jobs:
             ### Which file do I flash?
             | Artifact | Purpose |
             |---|---|
-            | `*-profiler-*.zip` | **Training kernel.** SPE + `kpti=off`, no LTO. Flash only to collect samples. Do not use daily. |
+            | `*-profiler-*.zip` | **Training kernel.** No Extra Optimizations like LTO. Flash only to collect samples. Do not use daily. |
             | `*-autofdo-*.zip` | **Production kernel.** ThinLTO + AutoFDO profile. This is the one to keep. |
-
-            > The profiler kernel is the only one that exposes `arm_spe_0`. If
-            > `ls /sys/bus/event_source/devices/` on the training kernel does not
-            > list it, the profile cannot be collected — see `docs/SPE-BRINGUP.md`.
 
             Verify `SHA256SUMS` before flashing.
           files: |
