@@ -1,5 +1,28 @@
 # Troubleshooting
 
+## The profiler kernel boots but `arm_spe_0` is missing
+
+Having `kpti=off` and the following configuration options is not sufficient:
+
+```text
+CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y
+CONFIG_ARM_SPE_PMU=y
+CONFIG_PID_IN_CONTEXTIDR=y
+```
+
+Confirm the running kernel exposes the device:
+
+```sh
+adb shell 'ls /sys/bus/event_source/devices/'
+```
+
+`armv8_pmuv3` is only the ordinary ARM PMU. Without `arm_spe_0`, the
+`perf_spe` input required by `create_llvm_prof` is unavailable. A regular
+`cpu-cycles` trace can still be collected for workload exploration, but it
+cannot be converted using the documented SPE AutoFDO command and should not be
+renamed as an `.afdo` profile. Check that the SPE device-tree node, PPI
+interrupt, and the DTB actually flashed into the boot image are all present.
+
 Symptom-first. If a section does not cover your case, start by proving the basics:
 
 ```sh

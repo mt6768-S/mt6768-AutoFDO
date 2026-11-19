@@ -60,14 +60,6 @@ the kernel, and creates an AnyKernel3 zip.
   --profile profiles/devices/selene/mt6768-game.afdo
 ```
 
-Set `ENABLE_KERNELSU=false` or `ENABLE_NOMOUNT=false` in `build.env` to disable
-either integration. The generated configuration enables the following options
-when the integrations are enabled: `CONFIG_KSU`, `CONFIG_KSU_EXTRAS`,
-`CONFIG_KSU_TAMPER_SYSCALL_TABLE`, `CONFIG_KSU_THRONE_TRACKER_ALWAYS_THREADED`,
-and `CONFIG_NOMOUNT`.
-
-The lower-level commands below explain the profiling workflow and are useful
-for debugging, but they do not replace the configured build script.
 
 ```sh
 # 0) Host requirements
@@ -83,15 +75,6 @@ python3 helpers/cc.py CONFIG_LTO_CLANG=n CONFIG_THINLTO=n \
 make O=out ARCH=arm64 -j"$(nproc)" LLVM=1 LLVM_IAS=1 \
         CROSS_COMPILE=aarch64-linux-gnu- \
         CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-```
-
-```sh
-# 2) Flash it, boot it, confirm SPE is live, then collect
-adb shell 'cat /proc/cmdline'                 # must contain kpti=off
-adb shell 'ls /sys/bus/event_source/devices/' # must list arm_spe_0
-adb shell '/data/local/tmp/perf record -e arm_spe_0/branch_filter=1/ -a -N -c 500009 \
-           -o /data/local/tmp/perf-game.data -- sleep 1800'
-adb pull /data/local/tmp/perf-game.data
 ```
 
 ```sh
@@ -111,9 +94,6 @@ make O=out ARCH=arm64 -j"$(nproc)" LLVM=1 LLVM_IAS=1 \
         CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
         CLANG_AUTOFDO_PROFILE="$PWD/profiles/devices/selene/mt6768-game.afdo"
 ```
-
-`kpti=off` is only honoured by the training kernel — never ship a production
-build with `CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y`.
 
 ## CI workflow
 
