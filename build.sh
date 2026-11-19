@@ -9,10 +9,6 @@
 #   optimized  production kernel: ThinLTO on, CONFIG_AUTOFDO_CLANG=y and
 #              CLANG_AUTOFDO_PROFILE=<profile>. Consumes the .afdo profile.
 #
-# KernelSU / NoMount are injected by helpers/integrate.py BEFORE this script
-# runs (see the workflow). This script never injects them itself. It reads the
-# flags that integrate.py wrote to kbuild-integrations.config and applies them
-# through helpers/cc.py, alongside the stage flags.
 #
 # Usage:
 #   ./build.sh --stage profiler  --device selene
@@ -50,10 +46,6 @@ Usage: ./build.sh --stage <profiler|optimized> --device <merlin|lancelot|selene>
               optimized = production kernel (ThinLTO + AutoFDO profile)
   --device    device codename; selects arch/arm64/configs/vendor/<device>.config
   --profile   .afdo profile; also read from $CLANG_AUTOFDO_PROFILE
-
-Environment:
-  CLEAN=1     wipe the kernel tree before building. This also removes the
-              KernelSU/NoMount injection, so run helpers/integrate.py again.
 EOF
 }
 
@@ -99,6 +91,7 @@ APPLY_SPE_PATCH="${APPLY_SPE_PATCH:-true}"
 
 KERNEL_ARCH="${KERNEL_ARCH:-arm64}"
 KERNEL_IMAGE_NAME="${KERNEL_IMAGE_NAME:-Image.gz-dtb}"
+KERNEL_DTB_NAME="${KERNEL_DTB_NAME:-mt6768.dtb}"
 EXTRA_CMDS="${EXTRA_CMDS:-LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-}"
 
 [ -n "$PROFILE" ] || PROFILE="${CLANG_AUTOFDO_PROFILE:-}"
@@ -123,6 +116,7 @@ fi
 
 command -v make >/dev/null || die "make not found"
 command -v git  >/dev/null || die "git not found"
+command -v curl >/dev/null || die "curl not found (needed for KernelSU/NoMount setup)"
 command -v clang >/dev/null || die "clang not found in PATH (set TOOLCHAIN_DIR)"
 
 mkdir -p "$KERNEL_WORKSPACE" "$DIST_DIR"
@@ -162,12 +156,33 @@ fetch_kernel() {
 	git -C "$KERNEL_DIR" -c advice.detachedHead=false checkout -q FETCH_HEAD
 }
 
-clean_tree() {
-	step "Resetting working tree (CLEAN=1)"
-	git -C "$KERNEL_DIR" reset -q --hard HEAD
-	git -C "$KERNEL_DIR" clean -q -fdx -e out
-	rm -rf "$KERNEL_DIR/out"
+# The upstream integration projects distribute their kernel integration as
+# setup scripts.  Run those scripts from the kernel root; both scripts modify
+# the tree in place and accept a branch/tag/commit as their sole argument.
+download_ksu() {
+	[ "${ENABLE_KERNELSU:-false}" = "true" ] || return 0
+	local source="${KERNELSU_SETUP_SOURCE:-https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh}"
+	local tag="${KERNELSU_TAG:-master}"
+	step "Installing KernelSU ($tag)"
+	[ -n "$source" ] || die "KERNELSU_SETUP_SOURCE is empty"
+	(
+		cd "$KERNEL_DIR"
+		curl -fsSL --retry 3 "$source" | sh -s -- "$tag"
+	)
 }
+
+download_nomount() {
+	[ "${ENABLE_NOMOUNT:-false}" = "true" ] || return 0
+	local source="${NOMOUNT_SETUP_SOURCE:-https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh}"
+	local tag="${NOMOUNT_TAG:-dev}"
+	step "Installing NoMount ($tag)"
+	[ -n "$source" ] || die "NOMOUNT_SETUP_SOURCE is empty"
+	(
+		cd "$KERNEL_DIR"
+		curl -fsSL --retry 3 "$source" | sh -s -- "$tag"
+	)
+}
+
 
 apply_spe_patch() {
 	local dts="arch/arm64/boot/dts/mediatek/mt6768.dts"
@@ -183,29 +198,6 @@ apply_spe_patch() {
 	step "Applying ARM SPE device-tree node"
 	git -C "$KERNEL_DIR" apply --whitespace=nowarn "$patch" \
 		|| die "SPE DT patch does not apply (tree moved upstream?)"
-}
-
-verify_integration() {
-	# Injection happens in helpers/integrate.py before this script runs. Here we
-	# only check that it is still present, so a CLEAN=1 run or a skipped step
-	# fails early with a clear message instead of a missing-symbol mystery.
-	local need=false
-	if [ "${ENABLE_KERNELSU:-false}" = "true" ]; then
-		need=true
-		[ -d "$KERNEL_DIR/KernelSU" ] || [ -d "$KERNEL_DIR/drivers/kernelsu" ] \
-			|| die "ENABLE_KERNELSU=true but KernelSU is not in the tree; run helpers/integrate.py first"
-	fi
-	if [ "${ENABLE_NOMOUNT:-false}" = "true" ]; then
-		need=true
-		[ -d "$KERNEL_DIR/nomount" ] || [ -d "$KERNEL_DIR/drivers/nomount" ] \
-			|| [ -d "$KERNEL_DIR/fs/nomount" ] \
-			|| die "ENABLE_NOMOUNT=true but NoMount is not in the tree; run helpers/integrate.py first"
-	fi
-	if [ "$need" = true ]; then
-		[ -s "$INTEGRATION_FRAGMENT" ] \
-			|| die "integration fragment missing: $INTEGRATION_FRAGMENT (run helpers/integrate.py first)"
-		log "integration present: $(wc -l < "$INTEGRATION_FRAGMENT") flag(s) in fragment"
-	fi
 }
 
 # ---------------------------------------------------------------------------
@@ -234,16 +226,26 @@ gen_config() {
 	mkdir -p out
 	./scripts/kconfig/merge_config.sh -m -O out "$base" "$frag" >/dev/null
 
-	# 1) Integration flags from helpers/integrate.py (KernelSU / NoMount).
-	#    Applied first so stage flags win if a key ever appears in both.
+	# Integration scripts add their Kconfig symbols to this fragment.
 	if [ -s "$INTEGRATION_FRAGMENT" ]; then
 		while IFS= read -r line; do
 			[ -n "$line" ] && edits+=("$line")
 		done < <(grep -E '^CONFIG_[A-Za-z0-9_]+=[^[:space:]]+$' "$INTEGRATION_FRAGMENT" || true)
 		log "integration flags: ${#edits[@]}"
 	fi
+	if [ "${ENABLE_NOMOUNT:-false}" = "true" ]; then
+		edits+=("CONFIG_NOMOUNT=y")
+	fi
+	if [ "${ENABLE_KERNELSU:-false}" = "true" ]; then
+		edits+=(
+			"CONFIG_KSU=y"
+			"CONFIG_KSU_EXTRAS=y"
+			"CONFIG_KSU_TAMPER_SYSCALL_TABLE=y"
+			"CONFIG_KSU_THRONE_TRACKER_ALWAYS_THREADED=y"
+		)
+	fi
 
-	# 2) Flags common to both stages.
+	# Flags common to both stages.
 	edits+=(
 		"CONFIG_AUTOFDO_CLANG=y"
 		"CONFIG_PROPELLER_CLANG=n"
@@ -301,15 +303,6 @@ assert_config() {
 	fi
 	cfg_off PROPELLER_CLANG || { warn "PROPELLER_CLANG is enabled but no propeller profile was supplied"; bad=1; }
 
-	# Every integration flag must survive olddefconfig. A flag that is dropped
-	# means this KernelSU/NoMount revision does not define that symbol.
-	if [ -s "$INTEGRATION_FRAGMENT" ]; then
-		while IFS= read -r line; do
-			[ -n "$line" ] || continue
-			grep -qx "$line" "$cfg" || { warn "integration flag dropped by olddefconfig: $line"; bad=1; }
-		done < <(grep -E '^CONFIG_' "$INTEGRATION_FRAGMENT" || true)
-	fi
-
 	if [ "$bad" -ne 0 ]; then
 		warn "relevant .config lines:"
 		grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|PID_IN_CONTEXTIDR|CFI_CLANG|PROPELLER|KSU|NOMOUNT)' \
@@ -332,7 +325,9 @@ build_kernel() {
 	make -j"$(nproc)" O=out ARCH="$KERNEL_ARCH" "${ccarg[@]}" $EXTRA_CMDS "${profile_arg[@]}"
 
 	local image="$KERNEL_DIR/out/arch/$KERNEL_ARCH/boot/$KERNEL_IMAGE_NAME"
+	local dtb="$KERNEL_DIR/out/arch/$KERNEL_ARCH/boot/dts/mediatek/$KERNEL_DTB_NAME"
 	[ -s "$image" ] || die "missing build output: $image"
+	[ -s "$dtb" ] || die "missing DTB output: $dtb"
 	[ -s "$KERNEL_DIR/out/vmlinux" ] || die "missing build output: out/vmlinux"
 }
 
@@ -366,12 +361,14 @@ cache_profiler_outputs() {
 	cp -f "$KERNEL_DIR/out/vmlinux" "$dest/vmlinux"
 	cp -f "$KERNEL_DIR/out/arch/$KERNEL_ARCH/boot/$KERNEL_IMAGE_NAME" "$dest/$KERNEL_IMAGE_NAME"
 	cp -f "$KERNEL_DIR/out/.config" "$dest/config"
+	cp -f "$KERNEL_DIR/out/arch/$KERNEL_ARCH/boot/dts/mediatek/$KERNEL_DTB_NAME" \
+	"$dest/$KERNEL_DTB_NAME"
 	write_provenance "$dest/provenance.env"
 }
 
 verify_cached_profiler() {
 	local dest="$PROFILER_CACHE_DIR/$DEVICE"
-	local need=("$dest/vmlinux" "$dest/$KERNEL_IMAGE_NAME" "$dest/provenance.env")
+	local need=("$dest/vmlinux" "$dest/$KERNEL_IMAGE_NAME" "$dest/provenance.env" "$dest/$KERNEL_DTB_NAME")
 	local f
 	for f in "${need[@]}"; do
 		[ -s "$f" ] || die "profiler cache is incomplete (missing $f); clear the cache key and rebuild"
@@ -381,21 +378,38 @@ verify_cached_profiler() {
 
 package_anykernel() {
 	local image="$1" zip="$2" note="${3:-}"
+	local dtb="$KERNEL_DIR/out/arch/$KERNEL_ARCH/boot/dts/mediatek/$KERNEL_DTB_NAME"
+
 	step "Packaging $(basename "$zip")"
 
 	if [ ! -d "$ANYKERNEL_DIR" ]; then
-		git clone -q --depth=1 -b "${ANYKERNEL3_BRANCH:-master}" "$ANYKERNEL3_SOURCE" "$ANYKERNEL_DIR" \
+		git clone -q --depth=1 -b "${ANYKERNEL3_BRANCH:-master}" \
+			"$ANYKERNEL3_SOURCE" "$ANYKERNEL_DIR" \
 			|| die "cannot clone AnyKernel3 from $ANYKERNEL3_SOURCE"
 	fi
 
+	[ -s "$image" ] || die "missing kernel image: $image"
+	[ -s "$dtb" ] || die "missing kernel DTB: $dtb"
+
+	mkdir -p "$ANYKERNEL_DIR/dtb"
+
 	cp -f "$image" "$ANYKERNEL_DIR/"
+	cp -f "$dtb" "$ANYKERNEL_DIR/dtb/$KERNEL_DTB_NAME"
+
 	if [ -n "$note" ]; then
 		printf '%s\n' "$note" > "$ANYKERNEL_DIR/AUTOFDO-README.txt"
 	fi
 
 	rm -f "$zip"
-	(cd "$ANYKERNEL_DIR" && zip -q -r9 "$zip" . -x '*.git*' 'README.md')
+	(
+		cd "$ANYKERNEL_DIR"
+		zip -q -r9 "$zip" . -x '*.git*' 'README.md'
+	)
+
 	[ -s "$zip" ] || die "zip was not created: $zip"
+
+	log "Image: $(basename "$image")"
+	log "DTB: dtb/$KERNEL_DTB_NAME"
 	log "$(basename "$zip") ($(du -h "$zip" | cut -f1))"
 }
 
@@ -432,11 +446,9 @@ if [ "$STAGE" = "profiler" ] && [ "${USE_CACHED_PROFILER:-false}" = "true" ]; th
 fi
 
 fetch_kernel
-if [ "${CLEAN:-0}" = "1" ]; then
-	clean_tree
-fi
 apply_spe_patch
-verify_integration
+download_ksu
+download_nomount
 gen_config
 assert_config
 build_kernel

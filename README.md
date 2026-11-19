@@ -1,7 +1,7 @@
-# mt6768 AutoFDO
+# MT6768 AutoFDO Kernel Builder
 
-Profile-guided optimization (AutoFDO, optionally + Propeller) for MediaTek
-**MT6768 / Helio G80–G85** Android kernels.
+Profile-guided optimization (AutoFDO + Propeller) for
+**MT6768** Android kernels.
 
 > **Status: experimental.** The workflow and documentation are in place; the
 > collection wrappers in `collector/` are still placeholders. Read
@@ -45,6 +45,29 @@ Clang version, optimization level, target CPU, and the codegen-relevant configs
 Details and the full compatibility list: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Quick start
+
+The supported entry point is `build.sh`. It clones the pinned kernel source,
+applies the profiler device-tree patch when needed, installs KernelSU and
+NoMount from the setup URLs in `build.env`, generates the configuration, builds
+the kernel, and creates an AnyKernel3 zip.
+
+```sh
+# Build the training kernel. It enables SPE and disables LTO.
+./build.sh --stage profiler --device selene
+
+# Build the optimized kernel from an AFDO profile.
+./build.sh --stage optimized --device selene \
+  --profile profiles/devices/selene/mt6768-game.afdo
+```
+
+Set `ENABLE_KERNELSU=false` or `ENABLE_NOMOUNT=false` in `build.env` to disable
+either integration. The generated configuration enables the following options
+when the integrations are enabled: `CONFIG_KSU`, `CONFIG_KSU_EXTRAS`,
+`CONFIG_KSU_TAMPER_SYSCALL_TABLE`, `CONFIG_KSU_THRONE_TRACKER_ALWAYS_THREADED`,
+and `CONFIG_NOMOUNT`.
+
+The lower-level commands below explain the profiling workflow and are useful
+for debugging, but they do not replace the configured build script.
 
 ```sh
 # 0) Host requirements
@@ -126,11 +149,13 @@ Profile resolution for the optimized stage, in order:
 3. Neither → the run publishes the profiler kernel only and warns in the
    summary. It never guesses.
 
-The profiler build is deliberately **clean** (no KernelSU/NoMount): it only
-exists to produce samples, and AutoFDO weights are keyed by function name, so
-the hot paths are unchanged. The cache key covers everything that can alter its
-output, so a profile generated months ago stays valid as long as the kernel
-commit, `build.env` and the SPE patch are unchanged.
+The profiler build uses the same KernelSU/NoMount settings as the production
+build by default. Keeping the integration configuration identical makes the
+training and production binaries comparable. Disable the integrations in
+`build.env` if a clean profiling kernel is specifically required. The cache key
+covers everything that can alter the profiler output, so a profile remains
+usable only while the kernel commit, toolchain, configuration, and workload
+assumptions remain compatible.
 
 Artifacts are per run and kept for 30 days; releases are tagged
 `kernel-r<run_number>`.
@@ -190,4 +215,3 @@ provenance clear, not because the profile is device-locked.
   separate experiment on top of a working AutoFDO build.
 - Profiles are workload-specific. A profile trained on benchmarks and applied
   to UI workloads will optimize the wrong thing.
-

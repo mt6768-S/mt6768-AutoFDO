@@ -14,6 +14,12 @@ Read [`DESIGN.md`](DESIGN.md) once; it explains *why* the two builds differ.
 - Compiler: Clang/LLD 17+ (19+ for Propeller)
 - Sampler: ARM SPE (`arm_spe_0`)
 
+The builder installs KernelSU and NoMount automatically by running the setup
+scripts configured in `build.env`. Their default configuration is enabled in
+both stages. To build without either integration, set the corresponding
+`ENABLE_KERNELSU` or `ENABLE_NOMOUNT` value to `false` before invoking
+`build.sh`.
+
 | Stage | Where | Output |
 |---|---|---|
 | 1. Profiling kernel | host | bootable image + unstripped `vmlinux` |
@@ -141,8 +147,10 @@ make O=out ARCH=arm64 -j"$(nproc)" \
     CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
 ```
 
-`.env` reference: `build.env` holds `KERNEL_SOURCE`, `CLANG_SOURCE`, the
-`EXTRA_CMDS`, KernelSU/NoMount/AnyKernel3 toggles.
+`build.env` holds `KERNEL_SOURCE`, `CLANG_SOURCE`, `EXTRA_CMDS`, the
+KernelSU/NoMount setup URLs and revisions, integration toggles, and AnyKernel3
+settings. The setup scripts are fetched with `curl`, so network access is
+required on the first build.
 
 Archive the training binary immediately — the profile is only valid against it:
 
