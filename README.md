@@ -1,7 +1,7 @@
 # mt6768 AutoFDO
 
-Profile-guided optimization (AutoFDO, optionally + Propeller) for MediaTek
-**MT6768 / Helio G80–G85** Android kernels.
+Profile-guided optimization (AutoFDO + Propeller) for
+**MT6768** Android kernels.
 
 > **Status: experimental.** The workflow and documentation are in place; the
 > collection wrappers in `collector/` are still placeholders. Read

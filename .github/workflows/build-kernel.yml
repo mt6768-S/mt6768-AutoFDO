@@ -1,23 +1,5 @@
 name: Build Kernel
 
-# Two-stage AutoFDO pipeline for MT6768.
-#
-#   profiler  job : training kernel (SPE, no LTO) -> flashable zip + vmlinux
-#   optimized job : production kernel (ThinLTO + .afdo) -> flashable zip
-#
-# Both stages inject KernelSU/NoMount from the same integrate.py before
-# defconfig, so the training and production kernels share the same integration.
-#
-# The profiler cache key covers build.env, build.sh, the SPE patch, the
-# kernel commit, and the integration code, so changing any of them forces a
-# rebuild instead of restoring a stale kernel.
-#
-# A profile must exist under profiles/ for the optimized stage to run:
-#   profiles/devices/<device>/*.afdo      used as-is
-#   profiles/devices/<device>/perf-*.data converted here with create_llvm_prof
-#                                         against the profiler build's vmlinux
-# With neither, the run publishes the profiler kernel only and warns.
-
 on:
   workflow_dispatch:
 
@@ -90,7 +72,7 @@ jobs:
           fi
 
           # Integration code is part of the profiler build, so it belongs in the key.
-          KEY=$( { cat build.env helpers/cc.py helpers/integrate.py build.sh
+          KEY=$( { cat build.env helpers/cc.py build.sh
                     cat kbuild/*.py 2>/dev/null || true
                     cat patches/*.patch 2>/dev/null || true
                     echo "commit=$COMMIT"; } | sha256sum | cut -c1-20 )
@@ -205,12 +187,6 @@ jobs:
           git -C "$src" checkout -f -q "$KERNEL_COMMIT"
           # Start from a clean tree: no leftover KSU/NoMount, no stale out/.
           git -C "$src" clean -fdxq
-
-      - name: Inject KernelSU and NoMount
-        run: |
-          set -Eeuo pipefail
-          PYTHONPATH="$GITHUB_WORKSPACE" python3 "$GITHUB_WORKSPACE/helpers/integrate.py" \
-            --source "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
       - name: Cache profiler build
         id: profiler-cache
@@ -365,12 +341,6 @@ jobs:
             || git -C "$src" fetch -q origin
           git -C "$src" checkout -f -q "$KERNEL_COMMIT"
           git -C "$src" clean -fdxq
-
-      - name: Inject KernelSU and NoMount
-        run: |
-          set -Eeuo pipefail
-          PYTHONPATH="$GITHUB_WORKSPACE" python3 "$GITHUB_WORKSPACE/helpers/integrate.py" \
-            --source "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
       - name: Cache create_llvm_prof
         id: autofdo-cache
