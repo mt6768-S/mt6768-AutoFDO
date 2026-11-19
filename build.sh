@@ -2,8 +2,6 @@
 #
 # build.sh — two-stage AutoFDO kernel builder for mt6768.
 #
-# Every build is one of two stages:
-#
 #   profiler   training kernel: LTO off, CONFIG_AUTOFDO_CLANG=y (emits -gmlt),
 #              ARM SPE enabled, kpti=off. Produces the vmlinux that perf.data
 #              must be converted against. Never ship this on a daily driver.
@@ -11,12 +9,16 @@
 #   optimized  production kernel: ThinLTO on, CONFIG_AUTOFDO_CLANG=y and
 #              CLANG_AUTOFDO_PROFILE=<profile>. Consumes the .afdo profile.
 #
+# KernelSU / NoMount are injected by helpers/integrate.py BEFORE this script
+# runs (see the workflow). This script never injects them itself. It reads the
+# flags that integrate.py wrote to kbuild-integrations.config and applies them
+# through helpers/cc.py, alongside the stage flags.
+#
 # Usage:
 #   ./build.sh --stage profiler  --device selene
 #   ./build.sh --stage optimized --device selene --profile profiles/devices/selene/mt6768.afdo
 #
-# Environment comes from build.env. Everything below can be overridden the
-# same way (environment variables win over nothing: build.env is authoritative).
+# Environment comes from build.env. build.env is authoritative.
 #
 set -Eeuo pipefail
 
@@ -48,6 +50,10 @@ Usage: ./build.sh --stage <profiler|optimized> --device <merlin|lancelot|selene>
               optimized = production kernel (ThinLTO + AutoFDO profile)
   --device    device codename; selects arch/arm64/configs/vendor/<device>.config
   --profile   .afdo profile; also read from $CLANG_AUTOFDO_PROFILE
+
+Environment:
+  CLEAN=1     wipe the kernel tree before building. This also removes the
+              KernelSU/NoMount injection, so run helpers/integrate.py again.
 EOF
 }
 
@@ -65,17 +71,11 @@ done
 # env loading
 # ---------------------------------------------------------------------------
 load_env() {
-	local file="$1" line
+	local file="$1"
 	[ -f "$file" ] || return 0
-	while IFS= read -r line || [ -n "$line" ]; do
-		line="${line%%#*}"                       # strip trailing comments
-		line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-		[ -n "$line" ] || continue
-		case "$line" in
-			[A-Za-z_][A-Za-z0-9_]*=*) export "$line" ;;
-			*) die "invalid line in $file: $line" ;;
-		esac
-	done < "$file"
+	command -v python3 >/dev/null || die "python3 not found (needed to parse $file)"
+	# helpers/env.py is the single parser shared with the CI workflow.
+	eval "$(python3 "$REPO_ROOT/helpers/env.py" --format export "$file")"
 }
 
 load_env "$REPO_ROOT/build.env"
@@ -90,19 +90,18 @@ TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$KERNEL_WORKSPACE/clang}"
 ANYKERNEL_DIR="${ANYKERNEL_DIR:-$KERNEL_WORKSPACE/AnyKernel3}"
 PROFILER_CACHE_DIR="${PROFILER_CACHE_DIR:-$KERNEL_WORKSPACE/profiler-cache}"
 DIST_DIR="${DIST_DIR:-$KERNEL_WORKSPACE/dist}"
+INTEGRATION_FRAGMENT="$KERNEL_DIR/kbuild-integrations.config"
 
 KERNEL_CONFIG_BASE="${KERNEL_CONFIG_BASE:-vendor/mt6768_defconfig}"
 KERNEL_CONFIG_FRAGMENT_DIR="${KERNEL_CONFIG_FRAGMENT_DIR:-vendor}"
 ENABLE_CCACHE="${ENABLE_CCACHE:-true}"
 APPLY_SPE_PATCH="${APPLY_SPE_PATCH:-true}"
-LOCALVERSION_SUFFIX="${LOCALVERSION_SUFFIX:-custom}"
 
 KERNEL_ARCH="${KERNEL_ARCH:-arm64}"
 KERNEL_IMAGE_NAME="${KERNEL_IMAGE_NAME:-Image.gz-dtb}"
 EXTRA_CMDS="${EXTRA_CMDS:-LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-}"
 
 [ -n "$PROFILE" ] || PROFILE="${CLANG_AUTOFDO_PROFILE:-}"
-[ -n "$DEVICE" ] || DEVICE="${DEVICE:-}"
 
 # ---------------------------------------------------------------------------
 # validation
@@ -155,8 +154,6 @@ fetch_kernel() {
 	mkdir -p "$(dirname "$KERNEL_DIR")"
 	git init -q "$KERNEL_DIR"
 	git -C "$KERNEL_DIR" remote add origin "$KERNEL_SOURCE"
-	# The pin in build.env is a commit SHA, so fetch it directly instead of
-	# using `clone -b`, which only accepts branch/tag names.
 	if ! git -C "$KERNEL_DIR" fetch --depth=1 -q origin "$KERNEL_SOURCE_BRANCH"; then
 		git -C "$KERNEL_DIR" fetch --depth=1 -q origin
 		git -C "$KERNEL_DIR" cat-file -e "${KERNEL_SOURCE_BRANCH}^{commit}" 2>/dev/null \
@@ -166,8 +163,8 @@ fetch_kernel() {
 }
 
 clean_tree() {
-	step "Resetting working tree"
-	git -C "$KERNEL_DIR" reset -q --hard "$(git -C "$KERNEL_DIR" rev-parse HEAD)"
+	step "Resetting working tree (CLEAN=1)"
+	git -C "$KERNEL_DIR" reset -q --hard HEAD
 	git -C "$KERNEL_DIR" clean -q -fdx -e out
 	rm -rf "$KERNEL_DIR/out"
 }
@@ -188,34 +185,26 @@ apply_spe_patch() {
 		|| die "SPE DT patch does not apply (tree moved upstream?)"
 }
 
-setup_root_solutions() {
-	# The training kernel is deliberately clean: it only exists to produce
-	# samples, and samples are keyed by function name, so extra functions from
-	# KernelSU/NoMount simply carry no weight in the profile.
-	[ "$STAGE" = "profiler" ] && { log "profiler stage: skipping root solution"; return 0; }
-
+verify_integration() {
+	# Injection happens in helpers/integrate.py before this script runs. Here we
+	# only check that it is still present, so a CLEAN=1 run or a skipped step
+	# fails early with a clear message instead of a missing-symbol mystery.
+	local need=false
 	if [ "${ENABLE_KERNELSU:-false}" = "true" ]; then
-		[ -n "${KERNELSU_SETUP_SOURCE:-}" ] || die "ENABLE_KERNELSU=true but KERNELSU_SETUP_SOURCE is empty"
-		step "Setting up KernelSU ($KERNELSU_SETUP_SOURCE @ ${KERNELSU_TAG:-master})"
-		(cd "$KERNEL_DIR" && curl -fsSL --retry 5 --retry-all-errors "$KERNELSU_SETUP_SOURCE" \
-			| bash -s "${KERNELSU_TAG:-master}")
+		need=true
+		[ -d "$KERNEL_DIR/KernelSU" ] || [ -d "$KERNEL_DIR/drivers/kernelsu" ] \
+			|| die "ENABLE_KERNELSU=true but KernelSU is not in the tree; run helpers/integrate.py first"
 	fi
-
 	if [ "${ENABLE_NOMOUNT:-false}" = "true" ]; then
-		step "Setting up NoMount (${NOMOUNT_TAG:-master})"
-		(cd "$KERNEL_DIR" && curl -fsSL --retry 5 --retry-all-errors "$NOMOUNT_SETUP_SOURCE" \
-			| bash -s "${NOMOUNT_TAG:-master}")
+		need=true
+		[ -d "$KERNEL_DIR/nomount" ] || [ -d "$KERNEL_DIR/drivers/nomount" ] \
+			|| [ -d "$KERNEL_DIR/fs/nomount" ] \
+			|| die "ENABLE_NOMOUNT=true but NoMount is not in the tree; run helpers/integrate.py first"
 	fi
-
-	if [ "${OLD_ANDROID_SUPPORT:-false}" = "true" ]; then
-		local p="$REPO_ROOT/patches/OLD_ANDROID_SUPPORT.patch"
-		if [ -f "$p" ]; then
-			step "Applying A11 compatibility patch"
-			git -C "$KERNEL_DIR" apply --whitespace=nowarn "$p"
-		else
-			warn "OLD_ANDROID_SUPPORT=true but patches/OLD_ANDROID_SUPPORT.patch is absent;"
-			warn "the build is otherwise identical, apart from CONFIG_MMC_CRYPTO_LEGACY."
-		fi
+	if [ "$need" = true ]; then
+		[ -s "$INTEGRATION_FRAGMENT" ] \
+			|| die "integration fragment missing: $INTEGRATION_FRAGMENT (run helpers/integrate.py first)"
+		log "integration present: $(wc -l < "$INTEGRATION_FRAGMENT") flag(s) in fragment"
 	fi
 }
 
@@ -235,6 +224,7 @@ gen_config() {
 	local frag="arch/arm64/configs/$KERNEL_CONFIG_FRAGMENT_DIR/$DEVICE.config"
 	local -a edits=()
 	local -a ccarg=(CC="$(cc_cmd)")
+	local line
 
 	step "Generating .config ($DEVICE fragment)"
 	cd "$KERNEL_DIR"
@@ -243,23 +233,25 @@ gen_config() {
 	rm -rf out
 	mkdir -p out
 	./scripts/kconfig/merge_config.sh -m -O out "$base" "$frag" >/dev/null
-	cd "$KERNEL_DIR"
 
+	# 1) Integration flags from helpers/integrate.py (KernelSU / NoMount).
+	#    Applied first so stage flags win if a key ever appears in both.
+	if [ -s "$INTEGRATION_FRAGMENT" ]; then
+		while IFS= read -r line; do
+			[ -n "$line" ] && edits+=("$line")
+		done < <(grep -E '^CONFIG_[A-Za-z0-9_]+=[^[:space:]]+$' "$INTEGRATION_FRAGMENT" || true)
+		log "integration flags: ${#edits[@]}"
+	fi
+
+	# 2) Flags common to both stages.
 	edits+=(
-		"CONFIG_LOCALVERSION=\"-${DEVICE}-${LOCALVERSION_SUFFIX}\""
 		"CONFIG_AUTOFDO_CLANG=y"
 		"CONFIG_PROPELLER_CLANG=n"
 		"CONFIG_CC_WERROR=n"
 		"CONFIG_KALLSYMS_ALL=y"
 	)
 
-	if [ "${ENABLE_KERNELSU:-false}" = "true" ]; then
-		edits+=("CONFIG_KSU=y")
-	fi
-	if [ "${OLD_ANDROID_SUPPORT:-false}" = "true" ]; then
-		edits+=("CONFIG_MMC_CRYPTO_LEGACY=y")
-	fi
-
+	# 3) Stage-specific flags.
 	if [ "$STAGE" = "profiler" ]; then
 		edits+=(
 			"CONFIG_LTO_CLANG=n"
@@ -279,17 +271,19 @@ gen_config() {
 		)
 	fi
 
-	python3 "$REPO_ROOT/helpers/cc.py" "${edits[@]}"
+	python3 "$REPO_ROOT/helpers/cc.py" --config "$KERNEL_DIR/out/.config" "${edits[@]}"
 
 	step "Resolving config with $(cc_cmd)"
 	make -s O=out ARCH="$KERNEL_ARCH" "${ccarg[@]}" $EXTRA_CMDS olddefconfig
 }
 
-cfg_is() { grep -qx "CONFIG_$1=$2" "$KERNEL_DIR/out/.config"; }
+cfg_is()  { grep -qx "CONFIG_$1=$2" "$KERNEL_DIR/out/.config"; }
 cfg_off() { ! grep -qx "CONFIG_$1=[ym]" "$KERNEL_DIR/out/.config"; }
 
 assert_config() {
-	local bad=0
+	local bad=0 line
+	local cfg="$KERNEL_DIR/out/.config"
+
 	if [ "$STAGE" = "profiler" ]; then
 		cfg_is AUTOFDO_CLANG y                          || { warn "AUTOFDO_CLANG is not y"; bad=1; }
 		cfg_is AUTOFDO_CLANG_PROFILER_ARM64_SPE y       || { warn "SPE helper is not y"; bad=1; }
@@ -307,15 +301,19 @@ assert_config() {
 	fi
 	cfg_off PROPELLER_CLANG || { warn "PROPELLER_CLANG is enabled but no propeller profile was supplied"; bad=1; }
 
-	if [ "${ENABLE_KERNELSU:-false}" = "true" ] && cfg_off KSU; then
-		warn "CONFIG_KSU is not enabled although ENABLE_KERNELSU=true;"
-		warn "the KernelSU setup script probably did not run or used a different symbol."
+	# Every integration flag must survive olddefconfig. A flag that is dropped
+	# means this KernelSU/NoMount revision does not define that symbol.
+	if [ -s "$INTEGRATION_FRAGMENT" ]; then
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			grep -qx "$line" "$cfg" || { warn "integration flag dropped by olddefconfig: $line"; bad=1; }
+		done < <(grep -E '^CONFIG_' "$INTEGRATION_FRAGMENT" || true)
 	fi
 
 	if [ "$bad" -ne 0 ]; then
 		warn "relevant .config lines:"
-		grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|PID_IN_CONTEXTIDR|CFI_CLANG|PROPELLER)' \
-			"$KERNEL_DIR/out/.config" >&2 || true
+		grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|PID_IN_CONTEXTIDR|CFI_CLANG|PROPELLER|KSU|NOMOUNT)' \
+			"$cfg" >&2 || true
 		die "config verification failed for the $STAGE stage"
 	fi
 	log "config verified for $STAGE stage"
@@ -350,6 +348,9 @@ write_provenance() {
 		echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 		echo "IMAGE_SHA256=$(sha256sum "$image" | cut -d' ' -f1)"
 		echo "VMLINUX_SHA256=$(sha256sum "$KERNEL_DIR/out/vmlinux" | cut -d' ' -f1)"
+		if [ -s "$INTEGRATION_FRAGMENT" ]; then
+			echo "INTEGRATION=$(grep -E '^CONFIG_' "$INTEGRATION_FRAGMENT" | tr '\n' ' ')"
+		fi
 		if [ "$STAGE" = "optimized" ]; then
 			echo "PROFILE=$PROFILE"
 			echo "PROFILE_SHA256=$(sha256sum "$PROFILE" | cut -d' ' -f1)"
@@ -431,11 +432,11 @@ if [ "$STAGE" = "profiler" ] && [ "${USE_CACHED_PROFILER:-false}" = "true" ]; th
 fi
 
 fetch_kernel
-if [ "${CLEAN:-0}" = "1" ] || [ "$STAGE" = "optimized" ]; then
+if [ "${CLEAN:-0}" = "1" ]; then
 	clean_tree
 fi
 apply_spe_patch
-setup_root_solutions
+verify_integration
 gen_config
 assert_config
 build_kernel

@@ -5,13 +5,12 @@ name: Build Kernel
 #   profiler  job : training kernel (SPE, no LTO) -> flashable zip + vmlinux
 #   optimized job : production kernel (ThinLTO + .afdo) -> flashable zip
 #
-# Both run as a matrix over the devices listed in build.env (DEVICES), and they
-# start at the same time: profiler and optimized are independent jobs. The only
-# ordering constraint is the release job, which waits for both.
+# Both stages inject KernelSU/NoMount from the same integrate.py before
+# defconfig, so the training and production kernels share the same integration.
 #
-# The profiler build is cached on the content of build.env, build.sh, the SPE
-# patch and the resolved kernel commit. When nothing that affects it changed,
-# the training kernel is not rebuilt — it is just repackaged.
+# The profiler cache key covers build.env, build.sh, the SPE patch, the
+# kernel commit, and the integration code, so changing any of them forces a
+# rebuild instead of restoring a stale kernel.
 #
 # A profile must exist under profiles/ for the optimized stage to run:
 #   profiles/devices/<device>/*.afdo      used as-is
@@ -46,7 +45,8 @@ jobs:
         name: Generate device matrix
         run: |
           set -Eeuo pipefail
-          devices=($(grep -E '^DEVICES=' build.env | cut -d= -f2- | xargs))
+          ALL=$(python3 "$GITHUB_WORKSPACE/helpers/env.py" --get DEVICES "$GITHUB_WORKSPACE/build.env")
+          read -ra devices <<< "$ALL"
 
           if [ "${#devices[@]}" -eq 0 ]; then
             echo "::error::DEVICES is empty in build.env"
@@ -63,7 +63,7 @@ jobs:
           echo "Devices: ${devices[*]}"
 
   # -------------------------------------------------------------------------
-  # 2. Resolve the kernel commit + profiler cache key
+  # 2. Resolve the pinned kernel commit and the profiler cache key
   # -------------------------------------------------------------------------
   prepare:
     name: Resolve kernel source
@@ -78,13 +78,7 @@ jobs:
         name: Resolve pinned commit and cache key
         run: |
           set -Eeuo pipefail
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import pathlib
-          for raw in pathlib.Path("build.env").read_text().splitlines():
-              line = raw.split("#", 1)[0].strip()
-              if line and "=" in line:
-                  print(line)
-          PY
+          eval "$(python3 "$GITHUB_WORKSPACE/helpers/env.py" --format export "$GITHUB_WORKSPACE/build.env")"
 
           git init -q "$RUNNER_TEMP/ksrc"
           git -C "$RUNNER_TEMP/ksrc" remote add origin "$KERNEL_SOURCE"
@@ -95,7 +89,9 @@ jobs:
             echo "::warning::Could not fetch $KERNEL_SOURCE_BRANCH; using it verbatim as the commit id."
           fi
 
-          KEY=$( { cat build.env helpers/cc.py build.sh
+          # Integration code is part of the profiler build, so it belongs in the key.
+          KEY=$( { cat build.env helpers/cc.py helpers/integrate.py build.sh
+                    cat kbuild/*.py 2>/dev/null || true
                     cat patches/*.patch 2>/dev/null || true
                     echo "commit=$COMMIT"; } | sha256sum | cut -c1-20 )
 
@@ -122,8 +118,8 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
     steps:
-      - uses: actions/checkout@v5
-
+      # Must run before checkout: it relocates the workspace onto the big
+      # volume, which would otherwise discard the freshly checked-out tree.
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -134,16 +130,12 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
+      - uses: actions/checkout@v5
+
       - name: Prepare environment
         run: |
           set -Eeuo pipefail
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import pathlib
-          for raw in pathlib.Path("build.env").read_text().splitlines():
-              line = raw.split("#", 1)[0].strip()
-              if line and "=" in line:
-                  print(line)
-          PY
+          python3 "$GITHUB_WORKSPACE/helpers/env.py" "$GITHUB_WORKSPACE/build.env" >> "$GITHUB_ENV"
           echo "BUILD_TIME=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -151,14 +143,10 @@ jobs:
             g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick jq \
             lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
             libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 \
-            libxml2-utils lzop pngcrush python3 rsync schedtool squashfs-tools \
-            unzip wget xsltproc zip zlib1g-dev zstd
+            libxml2-utils lzop pngcrush python3 python3-pip rsync schedtool \
+            squashfs-tools unzip wget xsltproc zip zlib1g-dev zstd
+          sudo python3 -m pip install --break-system-packages -q requests loguru
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
-
-      - name: Set swap to 10G
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
 
       - name: Cache Neutron Clang
         id: clang-cache
@@ -192,7 +180,37 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ccache-${{ env.DEVICE }}-profiler-${{ hashFiles('build.env') }}
+          restore-keys: |
+            ccache-${{ env.DEVICE }}-profiler-
           max-size: 2G
+
+      - name: Cache kernel source
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/android-kernel
+          key: kernel-${{ runner.os }}-${{ needs.prepare.outputs.kernel_commit }}
+
+      - name: Fetch pinned kernel source
+        env:
+          KERNEL_COMMIT: ${{ needs.prepare.outputs.kernel_commit }}
+        run: |
+          set -Eeuo pipefail
+          src="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          if [ ! -d "$src/.git" ]; then
+            git init -q "$src"
+            git -C "$src" remote add origin "$KERNEL_SOURCE"
+          fi
+          git -C "$src" fetch --depth=1 -q origin "$KERNEL_COMMIT" \
+            || git -C "$src" fetch -q origin
+          git -C "$src" checkout -f -q "$KERNEL_COMMIT"
+          # Start from a clean tree: no leftover KSU/NoMount, no stale out/.
+          git -C "$src" clean -fdxq
+
+      - name: Inject KernelSU and NoMount
+        run: |
+          set -Eeuo pipefail
+          PYTHONPATH="$GITHUB_WORKSPACE" python3 "$GITHUB_WORKSPACE/helpers/integrate.py" \
+            --source "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
       - name: Cache profiler build
         id: profiler-cache
@@ -206,10 +224,32 @@ jobs:
           USE_CACHED_PROFILER: ${{ steps.profiler-cache.outputs.cache-hit }}
         run: bash ./build.sh --stage profiler --device "$DEVICE"
 
+      - name: Verify integration flags in final config
+        run: |
+          set -Eeuo pipefail
+          cfg=kernel_workspace/profiler-cache/$DEVICE/config
+          frag=kernel_workspace/android-kernel/kbuild-integrations.config
+          [ -s "$cfg" ] || { echo "::error::No .config saved for $DEVICE"; exit 1; }
+          if [ ! -f "$frag" ]; then
+            echo "No integration fragment; nothing to verify."
+            exit 0
+          fi
+          fail=0
+          while IFS='=' read -r key val; do
+            [ -z "$key" ] && continue
+            if grep -qx "$key=$val" "$cfg"; then
+              echo "ok  $key=$val"
+            else
+              echo "::error::$key=$val is missing from final .config (unsupported by this KernelSU/NoMount version, or dropped by olddefconfig)"
+              fail=1
+            fi
+          done < "$frag"
+          exit $fail
+
       - name: Show profiler provenance
         run: |
           cat "kernel_workspace/profiler-cache/$DEVICE/provenance.env" || true
-          grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|PID_IN_CONTEXTIDR)' \
+          grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|PID_IN_CONTEXTIDR|KSU|NOMOUNT)' \
             "kernel_workspace/profiler-cache/$DEVICE/config" || true
 
       - name: Upload profiler kernel
@@ -223,7 +263,7 @@ jobs:
           retention-days: 30
 
   # -------------------------------------------------------------------------
-  # 4. Optimized kernels (one per device)
+  # 4. Production kernels
   # -------------------------------------------------------------------------
   optimized:
     name: Optimized (${{ matrix.device }})
@@ -241,8 +281,6 @@ jobs:
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
     steps:
-      - uses: actions/checkout@v5
-
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -253,16 +291,12 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
+      - uses: actions/checkout@v5
+
       - name: Prepare environment
         run: |
           set -Eeuo pipefail
-          python3 - <<'PY' >> "$GITHUB_ENV"
-          import pathlib
-          for raw in pathlib.Path("build.env").read_text().splitlines():
-              line = raw.split("#", 1)[0].strip()
-              if line and "=" in line:
-                  print(line)
-          PY
+          python3 "$GITHUB_WORKSPACE/helpers/env.py" "$GITHUB_WORKSPACE/build.env" >> "$GITHUB_ENV"
           echo "BUILD_TIME=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -270,14 +304,10 @@ jobs:
             g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick jq \
             lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
             libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 \
-            libxml2-utils lzop pngcrush python3 rsync schedtool squashfs-tools \
-            unzip wget xsltproc zip zlib1g-dev zstd
+            libxml2-utils lzop pngcrush python3 python3-pip rsync schedtool \
+            squashfs-tools unzip wget xsltproc zip zlib1g-dev zstd
+          sudo python3 -m pip install --break-system-packages -q requests loguru
           mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
-
-      - name: Set swap to 10G
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 10
 
       - name: Cache Neutron Clang
         id: clang-cache
@@ -311,7 +341,36 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ccache-${{ env.DEVICE }}-optimized-${{ hashFiles('build.env') }}
+          restore-keys: |
+            ccache-${{ env.DEVICE }}-optimized-
           max-size: 2G
+
+      - name: Cache kernel source
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/android-kernel
+          key: kernel-${{ runner.os }}-${{ needs.prepare.outputs.kernel_commit }}
+
+      - name: Fetch pinned kernel source
+        env:
+          KERNEL_COMMIT: ${{ needs.prepare.outputs.kernel_commit }}
+        run: |
+          set -Eeuo pipefail
+          src="$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
+          if [ ! -d "$src/.git" ]; then
+            git init -q "$src"
+            git -C "$src" remote add origin "$KERNEL_SOURCE"
+          fi
+          git -C "$src" fetch --depth=1 -q origin "$KERNEL_COMMIT" \
+            || git -C "$src" fetch -q origin
+          git -C "$src" checkout -f -q "$KERNEL_COMMIT"
+          git -C "$src" clean -fdxq
+
+      - name: Inject KernelSU and NoMount
+        run: |
+          set -Eeuo pipefail
+          PYTHONPATH="$GITHUB_WORKSPACE" python3 "$GITHUB_WORKSPACE/helpers/integrate.py" \
+            --source "$GITHUB_WORKSPACE/kernel_workspace/android-kernel"
 
       - name: Cache create_llvm_prof
         id: autofdo-cache
@@ -366,14 +425,12 @@ jobs:
           set -Eeuo pipefail
           vmlinux="kernel_workspace/profiler-cache/$DEVICE/vmlinux"
           if [ ! -s "$vmlinux" ]; then
-            # The profiler job runs in parallel with this one. On a fresh run its
-            # cache entry does not exist until that job finishes.
             echo "::warning::No cached profiler build for $DEVICE yet (profiler runs in parallel); skipping conversion."
             echo "ready=false" >> "$GITHUB_OUTPUT"
             {
               echo "### $DEVICE: conversion skipped"
               echo
-              echo "\`perf.data\` needs the profiler \`vmlinux\`, which is not in the"
+              echo '`perf.data` needs the profiler `vmlinux`, which is not in the'
               echo "cache yet. Re-run the workflow once the profiler job has saved it."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -403,7 +460,7 @@ jobs:
           {
             echo "### No AutoFDO profile for $DEVICE"
             echo
-            echo "The profiler kernel was still built. Flash it, collect \`perf.data\`,"
+            echo 'The profiler kernel was still built. Flash it, collect `perf.data`,'
             echo "then commit the profile under \`profiles/devices/$DEVICE/\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -412,12 +469,36 @@ jobs:
           steps.select.outputs.ready == 'true' || steps.convert.outputs.ready == 'true'
         run: bash ./build.sh --stage optimized --device "$DEVICE" --profile "$PROFILE"
 
+      - name: Verify integration flags in final config
+        if: |
+          steps.select.outputs.ready == 'true' || steps.convert.outputs.ready == 'true'
+        run: |
+          set -Eeuo pipefail
+          cfg=kernel_workspace/android-kernel/out/.config
+          frag=kernel_workspace/android-kernel/kbuild-integrations.config
+          [ -s "$cfg" ] || { echo "::error::No out/.config after optimized build"; exit 1; }
+          if [ ! -f "$frag" ]; then
+            echo "No integration fragment; nothing to verify."
+            exit 0
+          fi
+          fail=0
+          while IFS='=' read -r key val; do
+            [ -z "$key" ] && continue
+            if grep -qx "$key=$val" "$cfg"; then
+              echo "ok  $key=$val"
+            else
+              echo "::error::$key=$val is missing from final .config"
+              fail=1
+            fi
+          done < "$frag"
+          exit $fail
+
       - name: Show optimized provenance
         if: |
           steps.select.outputs.ready == 'true' || steps.convert.outputs.ready == 'true'
         run: |
           cat kernel_workspace/dist/*optimized*.provenance || true
-          grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE)' \
+          grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|KSU|NOMOUNT)' \
             kernel_workspace/android-kernel/out/.config | sort || true
 
       - name: Upload optimized kernel
@@ -442,6 +523,8 @@ jobs:
       !cancelled() &&
       (needs.profiler.result == 'success' || needs.optimized.result == 'success')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
