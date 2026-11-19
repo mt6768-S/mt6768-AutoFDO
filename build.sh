@@ -262,7 +262,9 @@ gen_config() {
 			"CONFIG_CFI_CLANG=n"
 			"CONFIG_PERF_EVENTS=y"
 			"CONFIG_HW_PERF_EVENTS=y"
-			"CONFIG_DEBUG_INFO=y"
+			"CONFIG_DEBUG_INFO=y",
+			"CONFIG_FUNCTION_TRACER=y
+			CONFIG_FUNCTION_GRAPH_TRACER=y"
 		)
 		[ "$HAS_SPE" = "y" ] && edits+=(
 			"CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y"
@@ -277,9 +279,6 @@ gen_config() {
 		edits+=(
 			"CONFIG_LTO_CLANG=y"
 			"CONFIG_THINLTO=y"
-			"CONFIG_PERF_EVENTS=y"
-			"CONFIG_HW_PERF_EVENTS=y"
-			"CONFIG_DEBUG_INFO=y"
 		)
 		[ "$HAS_SPE" = "y" ] || edits+=(
 			"CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=n"
