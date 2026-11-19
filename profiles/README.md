@@ -44,6 +44,17 @@ Empty directories are tracked with `.empty`.
    `merlin`/`lancelot`/`selene` when commit + Clang + config match. The device
    directory documents where the training data came from, it does not make the
    profile device-locked.
+6. **Simpleperf conversion.** `simpleperf record` produces Android simpleperf
+   data, not necessarily the host `perf.data` format expected by the AutoFDO
+   converter. Keep the exact `vmlinux-training` used during collection and
+   inspect/convert the samples with the matching simpleperf tooling (for
+   example `simpleperf report-sample` or the documented `create_llvm_prof`
+   simpleperf input path) before generating `.afdo`. Do not assume that a file
+   merely named `perf-*.data` is directly convertible.
+7. **Sampling provenance.** Record the kernel commit, Clang version, complete
+   `.config`, event, frequency, workload, and collection timestamps beside each
+   batch. A profile is only meaningful when its samples match the exact
+   training binary; never apply samples collected from a different build.
 
 ## Retention
 

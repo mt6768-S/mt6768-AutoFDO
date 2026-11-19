@@ -153,6 +153,49 @@ docs/                      design notes, step-by-step guide, troubleshooting
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | Symptom → cause → fix |
 | [`profiles/README.md`](profiles/README.md) | Profile naming, provenance and retention rules |
 
+## Collecting PMU profiles
+
+The collector scripts use `cpu-cycles:k` by default, which is the recommended
+first AutoFDO event on MT6768. Boot, game, and daily collection have different
+lifecycles: boot uses `simpleperf boot-record`, game waits for a package and
+records for five minutes, and daily records 96 fifteen-minute samples.
+
+```sh
+./collector/collect-game.sh com.example.game
+```
+
+If an Android device is connected, the script runs `simpleperf` through `adb`
+and pulls the result into `profiles/devices/selene/`. Set `ADB_SERIAL` when
+more than one device is connected:
+
+```sh
+ADB_SERIAL=ABC123 ./collector/collect-game.sh
+```
+
+When `adb` is available, the host wrappers enable/run collection through adb
+and pull the completed files. They are not intended to remain connected for a
+24-hour run. When `adb` is unavailable, use the Android/Termux scripts in
+`collector/device/`; they run manually as root and write directly to
+`/storage/emulated/0/profiles/`. Boot is manually enabled or disabled with
+`collector/device/boot.sh enable|disable`.
+
+`PERF_EVENT` can override the event, and `PERF_INTERVAL` controls the sampling
+ frequency (`-f`). The game and daily ADB wrappers use it for every recording;
+ boot uses it when scheduling the next boot. For example:
+
+```sh
+PERF_EVENT=instructions ./collector/collect-game.sh com.example.game 60
+PERF_EVENT=branch-instructions ./collector/collect-daily.sh
+```
+
+The event names supported by the scripts include `branch-instructions`,
+`bus-cycles`, `cpu-cycles`, `instructions`, `stalled-cycles-backend`,
+`stalled-cycles-frontend`, `arm_dsu_0/bus_cycles/`, `arm_dsu_0/cycles/`,
+`armv8_pmuv3/bus_cycles/`, `armv8_pmuv3/cpu_cycles/`,
+`armv8_pmuv3/inst_spec/`, and the `raw-*` events documented in
+`collector/common.sh`. Raw stall and ZA events may only work on CPUs 6–7;
+start with `cpu-cycles` and validate alternatives using `simpleperf stat`.
+
 ## Supported devices
 
 Device directories follow the kernel tree's codenames:
