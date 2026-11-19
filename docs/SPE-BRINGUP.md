@@ -25,9 +25,10 @@ The good news is that none is needed:
 
 - `drivers/perf/arm_spe_pmu.c` and `CONFIG_ARM_SPE_PMU` already exist in the
   4.19 tree (ARM SPE landed upstream in 4.14/4.19). **No driver backport.**
-- The DT node is 4 lines (Step 1).
-- `CONFIG_PID_IN_CONTEXTIDR` is only needed for per-process (`-p`) profiles;
-  system-wide `-a` works without it. **Skip that backport.**
+- The DT node is 4 lines (Step 1), already carried by
+  `patches/0001-arm64-dts-mt6768-add-arm-spe-node.patch`.
+- `CONFIG_PID_IN_CONTEXTIDR` also exists (`arch/arm64/Kconfig.debug`) and the
+  helper Kconfig selects it. **No PID backport either.**
 - `CONFIG_AUTOFDO_CLANG` + the arm64/SPE helper are already carried by this
   tree (see `INSTRUCTIONS.md#patch-stack`).
 
@@ -74,8 +75,9 @@ grep -i spe /proc/interrupts                  # per-CPU PPI counters
 
 This costs one build and answers the whole question.
 
-Add the node next to the existing `arm,armv8-pmuv3` node in
-`arch/arm64/boot/dts/mediatek/mt6768.dts`:
+The patch is already in the repository and `build.sh --stage profiler` applies
+it automatically. It adds this node next to the existing `arm,armv8-pmuv3` node
+in `arch/arm64/boot/dts/mediatek/mt6768.dts`:
 
 ```dts
 spe-pmu {
@@ -105,21 +107,20 @@ interrupt never fires, the number is wrong — the SoC's interrupt map (MTK
 TRM / `mt6768-mainline` community) is the only authoritative source. Do not
 brute-force PPI numbers on a live device: several PPIs are timers and PMU.
 
-## Step 2 — Get PID attribution (optional)
+## Step 2 — PID attribution (already wired)
 
-Without `CONFIG_PID_IN_CONTEXTIDR`, SPE records carry no PID, so `perf record
--p <pid>` produces nothing and `create_llvm_prof` cannot attribute per process.
-System-wide (`-a`) collection works without it.
+`CONFIG_PID_IN_CONTEXTIDR` **exists in this tree** — it is defined in
+`arch/arm64/Kconfig.debug`, implemented by `contextidr_thread_switch()` in
+`arch/arm64/include/asm/mmu_context.h`, and already called from `__switch_to()`
+in `arch/arm64/kernel/process.c`.
 
-The option does not exist in this 4.19 tree; the helper Kconfig `select`s it
-anyway (harmless warning). To add it, backport mainline's implementation:
+`CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y` selects it, and `build.sh` also
+sets it explicitly for the profiler stage, so SPE records carry a PID and
+`perf record -p <pid>` works.
 
-- `arch/arm64/Kconfig`: `config PID_IN_CONTEXTIDR` (bool, default n)
-- `arch/arm64/mm/context.c`: `contextidr_thread_switch()`, writing
-  `task_pid_nr(next)` into `CONTEXTIDR_EL1`
-- call it from `__switch_to()` in `arch/arm64/kernel/process.c`
-
-Keep it **off** in production (it writes a sysreg on every context switch).
+Keep it **off** in production (it writes a sysreg on every context switch);
+`build.sh` asserts that it is disabled in the optimized stage and enabled in
+the profiler stage.
 
 ## Step 3 — Verify the sampler end to end
 

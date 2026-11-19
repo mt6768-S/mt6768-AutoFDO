@@ -64,8 +64,8 @@ trade-off, not a bug.
 | `CONFIG_PROPELLER_CLANG` | `n` | optional | needs LLVM 19+ |
 | `CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE` | `y` | **`n`** | forces `kpti=off` |
 | `CONFIG_ARM_SPE_PMU` | `y` (selected) | any | sampler driver |
-| `CONFIG_PID_IN_CONTEXTIDR` | `y` (selected) | any | see known gap #1 |
-| `CONFIG_CFI_CLANG` | same | same | keep identical |
+| `CONFIG_PID_IN_CONTEXTIDR` | `y` (selected) | `n` | writes PID to `CONTEXTIDR_EL1`; costs a sysreg write per switch |
+| `CONFIG_CFI_CLANG` | `n` (forced) | `y` | `CFI_CLANG` depends on `LTO_CLANG`, so it cannot be on with LTO off |
 | `CONFIG_SHADOW_CALL_STACK` | same | same | keep identical |
 | `CONFIG_KASAN` / `KCOV` / lockdep | `n` | `n` | instrumentation distorts samples |
 | `CONFIG_DEBUG_INFO` | `n` | `n` | `-gmlt` comes from AutoFDO |
@@ -158,20 +158,28 @@ that still contains the ordering markers.
 
 ## 6. Known gaps in this repository
 
-1. **SPE plumbing on 4.19 is incomplete.** This is the project's current blocker.
-   - `CONFIG_PID_IN_CONTEXTIDR` does not exist in this tree; the helper Kconfig
-     `select`s it, which yields a Kconfig warning and no PID context. Samples
-     are therefore system-wide only (`perf record -a`).
+1. **SPE plumbing: driver and PID tagging are already present; only the DT
+   node is missing.** This is the project's current blocker.
+   - `CONFIG_PID_IN_CONTEXTIDR` **does exist** (`arch/arm64/Kconfig.debug`),
+     `contextidr_thread_switch()` is implemented and called. The helper Kconfig
+     selects it; `build.sh` enables it in the profiler stage and asserts it is
+     off in production. No backport needed.
    - The MT6768 device trees (vendor *and* `mt6768-mainline`) have no SPE node
      (`arm,statistical-profiling-extension-v1`), and the driver requires a
      per-CPU PPI. Without that node `arm_spe_0` never registers, so
-     `perf record -e arm_spe_0//` fails. The reference-design PPI is 5 and is
-     unused in MT6768's PPI map, but the wiring is SoC-specific.
+     `perf record -e arm_spe_0//` fails. `build.sh` applies
+     `patches/0001-arm64-dts-mt6768-add-arm-spe-node.patch` for the profiler
+     stage only. The reference-design PPI is 5 and is unused in MT6768's PPI
+     map, but the wiring is SoC-specific and unverified.
    - SPE presence per core (A75 vs A55) must be verified via
      `ID_AA64DFR0_EL1.PMSVer` — the feature is optional and firmware can hide it.
      Until that bit is non-zero, there is no sampler and no profile.
    - Practical checklist: [`SPE-BRINGUP.md`](SPE-BRINGUP.md).
-2. **`collector/*.sh` are empty.** The documented raw `perf` commands are the
+2. **The training kernel is built without the root-solution patch stack.**
+   KernelSU/NoMount only add functions and call-site hooks; AutoFDO weight is
+   keyed by function name, so the hot paths that matter are unchanged. Do not
+   expect samples for code that only exists in the production kernel.
+3. **`collector/*.sh` are empty.** The documented raw `perf` commands are the
    source of truth until the wrappers exist. They should only shell out to
    exactly those commands (boot/daily/game), pull the files, and print sample
    counts.

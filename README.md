@@ -92,16 +92,62 @@ make O=out ARCH=arm64 -j"$(nproc)" LLVM=1 LLVM_IAS=1 \
 `kpti=off` is only honoured by the training kernel — never ship a production
 build with `CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE=y`.
 
+## CI workflow
+
+`.github/workflows/build-kernel.yml` runs the whole pipeline on GitHub Actions:
+
+```
+generate-build-matrix ──> prepare ──┬──> profiler (matrix, cached) ──┐
+                                    └──> optimized (matrix) ─────────┴──> release
+```
+
+`profiler` and `optimized` are **independent jobs and start together**; nothing
+waits for the training kernel to finish compiling. Only `release` joins them.
+
+| Job | What it does |
+|---|---|
+| `prepare` | Resolves the pinned kernel commit and hashes `build.env`, `build.sh`, the SPE patch and the commit into the profiler cache key. |
+| `profiler` | Builds the training kernel (SPE, LTO off) once per device, packages `*-profiler-*.zip`, stores `vmlinux` + `Image.gz-dtb` + provenance in the cache. **Skipped entirely when the cache key hits.** |
+| `optimized` | Per device: resolves a profile, builds with ThinLTO + AutoFDO, packages `*-autofdo-*.zip`. |
+| `release` | Publishes every zip plus `SHA256SUMS`. |
+
+Device list lives in `build.env` (`DEVICES=merlin lancelot selene`); there are no
+workflow inputs — a manual run always builds every listed device. Root solution
+and toolchain are also `build.env` settings, with no per-variant config files.
+
+Profile resolution for the optimized stage, in order:
+
+1. `profiles/devices/<device>/*.afdo` (or `profiles/common/*.afdo`) — used as-is.
+2. `profiles/devices/<device>/perf-*.data` — converted in CI with
+   `create_llvm_prof` against the **cached profiler `vmlinux`**, so the profile
+   is guaranteed to match the training build. Because the profiler runs in
+   parallel, a *brand-new* profiler build is not in the cache yet: the
+   conversion is then skipped with a warning, and the next run picks it up.
+3. Neither → the run publishes the profiler kernel only and warns in the
+   summary. It never guesses.
+
+The profiler build is deliberately **clean** (no KernelSU/NoMount): it only
+exists to produce samples, and AutoFDO weights are keyed by function name, so
+the hot paths are unchanged. The cache key covers everything that can alter its
+output, so a profile generated months ago stays valid as long as the kernel
+commit, `build.env` and the SPE patch are unchanged.
+
+Artifacts are per run and kept for 30 days; releases are tagged
+`kernel-r<run_number>`.
+
 ## Repository layout
 
 ```
-build.env                  kernel source, toolchain and packaging defaults
+build.env                  kernel source, device list, toolchain, root solution, packaging
+build.sh                   the two-stage builder (--stage profiler|optimized)
+patches/                   SPE device-tree node (training stage only)
 collector/                 on-device workload wrappers (boot / game / daily) — WIP
 helpers/cc.py              tiny .config editor used by the build steps
 profiles/                  collected profiles, one directory per device
   common/                  device-independent profiles
   devices/{merlin,lancelot,selene}/
 docs/                      design notes, step-by-step guide, troubleshooting
+.github/workflows/         the CI pipeline described above
 ```
 
 ## Documentation
@@ -129,13 +175,15 @@ provenance clear, not because the profile is device-locked.
 ## Known limitations
 
 - **SPE availability is unverified and currently the project's blocker.** Neither
-  the vendor DT nor the LineageOS/mainline MT6768 DTs have an SPE node, and the
-  tree lacks `CONFIG_PID_IN_CONTEXTIDR`. No ready-made patch exists — but no
-  driver backport is needed either: `arm_spe_pmu` is already in this 4.19 tree,
-  so the missing piece is a 4-line DT node. `simpleperf list` showing only
-  `armv8_pmuv3` proves nothing (the SPE PMU has no `events/` entries); the only
-  valid test is `arm_spe_0` in `/sys/bus/event_source/devices/` on a training
-  kernel. See [`docs/SPE-BRINGUP.md`](docs/SPE-BRINGUP.md).
+  the vendor DT nor the LineageOS/mainline MT6768 DTs have an SPE node. No
+  ready-made patch exists — but no driver or PID backport is needed either:
+  `arm_spe_pmu` and `CONFIG_PID_IN_CONTEXTIDR` are already in this 4.19 tree, so
+  the missing piece is a 4-line DT node, carried by
+  `patches/0001-arm64-dts-mt6768-add-arm-spe-node.patch`. `simpleperf list`
+  showing only `armv8_pmuv3` proves nothing (the SPE PMU has no `events/`
+  entries); the only valid test is `arm_spe_0` in
+  `/sys/bus/event_source/devices/` on a training kernel. See
+  [`docs/SPE-BRINGUP.md`](docs/SPE-BRINGUP.md).
 - `collector/*.sh` are empty. Until they land, use the raw `perf` commands from
   [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md).
 - Propeller needs Clang/LLD 19+ and a second profiling round; treat it as a

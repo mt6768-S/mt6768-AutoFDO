@@ -3,6 +3,12 @@
 Step-by-step guide from a clean kernel tree to a profile-optimized kernel.
 Read [`DESIGN.md`](DESIGN.md) once; it explains *why* the two builds differ.
 
+> **Automation:** stages 1, 4 and 5 are implemented by [`../build.sh`](../build.sh)
+> and `.github/workflows/build-kernel.yml`. The manual commands below are the
+> reference those scripts execute and are worth reading once, especially when a
+> build fails. `build.sh --stage profiler|optimized` verifies the resulting
+> `.config` so a mistyped symbol cannot silently produce the wrong build.
+
 - Target tree: [`mt6768-S/android_kernel_xiaomi_mt6768`](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768) (Linux 4.19, `vendor/mt6768_defconfig`)
 - Arch: arm64 (Cortex-A75/A55)
 - Compiler: Clang/LLD 17+ (19+ for Propeller)
@@ -221,9 +227,12 @@ adb shell '/data/local/tmp/perf record -e arm_spe_0/branch_filter=1/ -a -N -c 50
 
 Notes:
 
-- `-a` is required: without `CONFIG_PID_IN_CONTEXTIDR` the kernel does not tag
-  SPE records with a PID, so per-process (`-p`) filtering produces nothing
-  useful. Use `-p` only if you know the tree has that option.
+- `-a` is used for every profile here: it covers all CPUs and all processes,
+  which is what the kernel's own hot paths need. This tree has
+  `CONFIG_PID_IN_CONTEXTIDR` and the training build enables it, so `-p <pid>`
+  also works when you want to isolate one app — but do not use `-p` for the
+  boot/daily profiles, where most of the interesting work is spread across
+  processes.
 - `-c 500009`: a prime-ish sampling period, as recommended upstream. Lower =
   more samples = larger files and more overhead.
 - `-N` skips the build-id cache work; the profile only needs kernel symbols

@@ -178,11 +178,16 @@ compresses much better than text.
 
 ### `selects non-existing symbol PID_IN_CONTEXTIDR`
 
-Expected on this 4.19 tree. Kconfig prints a warning and continues; the SPE
-driver works, but samples carry no PID, so `perf record -p <pid>` is not usable.
-Either ignore it and profile system-wide, or backport
-`CONFIG_PID_IN_CONTEXTIDR` (writes the PID into `CONTEXTIDR_EL1` on context
-switch) and re-enable it.
+This should **not** happen on the pinned commit: `arch/arm64/Kconfig.debug`
+defines `CONFIG_PID_IN_CONTEXTIDR`, `arch/arm64/include/asm/mmu_context.h`
+implements `contextidr_thread_switch()`, and `__switch_to()` already calls it.
+The training config enables it, so SPE records carry a PID.
+
+If the warning still appears, your tree is not the pinned one (or a downstream
+patch removed the symbol). Then either ignore it and profile system-wide
+(`perf record -a`), or restore the three pieces listed above from mainline.
+Keep the option **off** in production: it writes a sysreg on every context
+switch.
 
 ### `--lto-sample-profile` / `-fprofile-sample-use` unknown
 

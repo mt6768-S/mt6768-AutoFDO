@@ -1,0 +1,17 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6768.dts b/arch/arm64/boot/dts/mediatek/mt6768.dts
+index e0ee00b..c3e3774 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6768.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6768.dts
+@@ -445,6 +445,12 @@ firmware_class.path=/vendor/firmware";
+ 		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
+ 	};
+ 
++	spe-pmu {
++		compatible = "arm,statistical-profiling-extension-v1";
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_PPI 5 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	dsu-pmu-0 {
+ 		compatible = "arm,dsu-pmu";
+ 		interrupts = <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH>;

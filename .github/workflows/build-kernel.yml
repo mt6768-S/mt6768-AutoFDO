@@ -1,0 +1,497 @@
+name: Build Kernel
+
+# Two-stage AutoFDO pipeline for MT6768.
+#
+#   profiler  job : training kernel (SPE, no LTO) -> flashable zip + vmlinux
+#   optimized job : production kernel (ThinLTO + .afdo) -> flashable zip
+#
+# Both run as a matrix over the devices listed in build.env (DEVICES), and they
+# start at the same time: profiler and optimized are independent jobs. The only
+# ordering constraint is the release job, which waits for both.
+#
+# The profiler build is cached on the content of build.env, build.sh, the SPE
+# patch and the resolved kernel commit. When nothing that affects it changed,
+# the training kernel is not rebuilt — it is just repackaged.
+#
+# A profile must exist under profiles/ for the optimized stage to run:
+#   profiles/devices/<device>/*.afdo      used as-is
+#   profiles/devices/<device>/perf-*.data converted here with create_llvm_prof
+#                                         against the profiler build's vmlinux
+# With neither, the run publishes the profiler kernel only and warns.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Which devices?
+  # -------------------------------------------------------------------------
+  generate-build-matrix:
+    name: What to build?
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      has_devices: ${{ steps.set.outputs.has_devices }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: set
+        name: Generate device matrix
+        run: |
+          set -Eeuo pipefail
+          devices=($(grep -E '^DEVICES=' build.env | cut -d= -f2- | xargs))
+
+          if [ "${#devices[@]}" -eq 0 ]; then
+            echo "::error::DEVICES is empty in build.env"
+            exit 1
+          fi
+
+          json=$(printf '%s\n' "${devices[@]}" | jq -R . | jq -s '{device: .}')
+          {
+            echo "has_devices=true"
+            echo "matrix<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Devices: ${devices[*]}"
+
+  # -------------------------------------------------------------------------
+  # 2. Resolve the kernel commit + profiler cache key
+  # -------------------------------------------------------------------------
+  prepare:
+    name: Resolve kernel source
+    runs-on: ubuntu-latest
+    outputs:
+      kernel_commit: ${{ steps.resolve.outputs.kernel_commit }}
+      profiler_key: ${{ steps.resolve.outputs.profiler_key }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: resolve
+        name: Resolve pinned commit and cache key
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import pathlib
+          for raw in pathlib.Path("build.env").read_text().splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if line and "=" in line:
+                  print(line)
+          PY
+
+          git init -q "$RUNNER_TEMP/ksrc"
+          git -C "$RUNNER_TEMP/ksrc" remote add origin "$KERNEL_SOURCE"
+          if git -C "$RUNNER_TEMP/ksrc" fetch --depth=1 -q origin "$KERNEL_SOURCE_BRANCH"; then
+            COMMIT="$(git -C "$RUNNER_TEMP/ksrc" rev-parse FETCH_HEAD)"
+          else
+            COMMIT="$KERNEL_SOURCE_BRANCH"
+            echo "::warning::Could not fetch $KERNEL_SOURCE_BRANCH; using it verbatim as the commit id."
+          fi
+
+          KEY=$( { cat build.env helpers/cc.py build.sh
+                    cat patches/*.patch 2>/dev/null || true
+                    echo "commit=$COMMIT"; } | sha256sum | cut -c1-20 )
+
+          echo "kernel_commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "profiler_key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "Kernel commit: $COMMIT"
+          echo "Profiler cache key: $KEY"
+
+  # -------------------------------------------------------------------------
+  # 3. Training kernels (one per device, cached)
+  # -------------------------------------------------------------------------
+  profiler:
+    name: Profiler kernel (${{ matrix.device }})
+    needs: [generate-build-matrix, prepare]
+    if: needs.generate-build-matrix.outputs.has_devices == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-build-matrix.outputs.matrix) }}
+    env:
+      DEVICE: ${{ matrix.device }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Prepare environment
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import pathlib
+          for raw in pathlib.Path("build.env").read_text().splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if line and "=" in line:
+                  print(line)
+          PY
+          echo "BUILD_TIME=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick jq \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
+            libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 \
+            libxml2-utils lzop pngcrush python3 rsync schedtool squashfs-tools \
+            unzip wget xsltproc zip zlib1g-dev zstd
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+
+      - name: Set swap to 10G
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: Cache Neutron Clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/clang
+          key: clang-${{ runner.os }}-${{ hashFiles('build.env') }}
+
+      - name: Download Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p clang
+          case "$CLANG_SOURCE" in
+            *.tar.gz)  wget -nv -O clang.tar.gz  "$CLANG_SOURCE"; tar -C clang/ -zxf clang.tar.gz; rm clang.tar.gz ;;
+            *.tar.xz)  wget -nv -O clang.tar.xz  "$CLANG_SOURCE"; tar -C clang/ -Jxf clang.tar.xz; rm clang.tar.xz ;;
+            *.tar.zst) wget -nv -O clang.tar.zst "$CLANG_SOURCE"; tar -C clang/ -I zstd -xf clang.tar.zst; rm clang.tar.zst ;;
+            *.zip)     wget -nv -O clang.zip     "$CLANG_SOURCE"; unzip -q clang.zip -d clang/; rm clang.zip ;;
+            *.git)     git clone --depth=1 -b "${CLANG_BRANCH:-main}" "$CLANG_SOURCE" clang ;;
+            *)         echo "::error::Unsupported CLANG_SOURCE: $CLANG_SOURCE"; exit 1 ;;
+          esac
+          if [ "$(find ./clang -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ] \
+             && [ ! -d ./clang/bin ]; then
+            mv -f "$(find ./clang -mindepth 1 -maxdepth 1 -type d)"/* ./clang
+          fi
+          test -x ./clang/bin/clang || { echo "::error::clang not found after extraction"; exit 1; }
+          ./clang/bin/clang --version | head -n1
+
+      - name: Cache compiler objects
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ env.DEVICE }}-profiler-${{ hashFiles('build.env') }}
+          max-size: 2G
+
+      - name: Cache profiler build
+        id: profiler-cache
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/profiler-cache/${{ env.DEVICE }}
+          key: profiler-${{ env.DEVICE }}-${{ needs.prepare.outputs.profiler_key }}
+
+      - name: Build (or reuse) profiler kernel
+        env:
+          USE_CACHED_PROFILER: ${{ steps.profiler-cache.outputs.cache-hit }}
+        run: bash ./build.sh --stage profiler --device "$DEVICE"
+
+      - name: Show profiler provenance
+        run: |
+          cat "kernel_workspace/profiler-cache/$DEVICE/provenance.env" || true
+          grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE|PID_IN_CONTEXTIDR)' \
+            "kernel_workspace/profiler-cache/$DEVICE/config" || true
+
+      - name: Upload profiler kernel
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.DEVICE }}-profiler-r${{ github.run_number }}
+          path: |
+            kernel_workspace/dist/*profiler*.zip
+            kernel_workspace/dist/*profiler*.provenance
+          if-no-files-found: error
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # 4. Optimized kernels (one per device)
+  # -------------------------------------------------------------------------
+  optimized:
+    name: Optimized (${{ matrix.device }})
+    needs: [generate-build-matrix, prepare]
+    if: |
+      !cancelled() && needs.generate-build-matrix.outputs.has_devices == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-build-matrix.outputs.matrix) }}
+    env:
+      DEVICE: ${{ matrix.device }}
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Prepare environment
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import pathlib
+          for raw in pathlib.Path("build.env").read_text().splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if line and "=" in line:
+                  print(line)
+          PY
+          echo "BUILD_TIME=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex \
+            g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick jq \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
+            libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 \
+            libxml2-utils lzop pngcrush python3 rsync schedtool squashfs-tools \
+            unzip wget xsltproc zip zlib1g-dev zstd
+          mkdir -p "$GITHUB_WORKSPACE/kernel_workspace"
+
+      - name: Set swap to 10G
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: Cache Neutron Clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/clang
+          key: clang-${{ runner.os }}-${{ hashFiles('build.env') }}
+
+      - name: Download Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p clang
+          case "$CLANG_SOURCE" in
+            *.tar.gz)  wget -nv -O clang.tar.gz  "$CLANG_SOURCE"; tar -C clang/ -zxf clang.tar.gz; rm clang.tar.gz ;;
+            *.tar.xz)  wget -nv -O clang.tar.xz  "$CLANG_SOURCE"; tar -C clang/ -Jxf clang.tar.xz; rm clang.tar.xz ;;
+            *.tar.zst) wget -nv -O clang.tar.zst "$CLANG_SOURCE"; tar -C clang/ -I zstd -xf clang.tar.zst; rm clang.tar.zst ;;
+            *.zip)     wget -nv -O clang.zip     "$CLANG_SOURCE"; unzip -q clang.zip -d clang/; rm clang.zip ;;
+            *.git)     git clone --depth=1 -b "${CLANG_BRANCH:-main}" "$CLANG_SOURCE" clang ;;
+            *)         echo "::error::Unsupported CLANG_SOURCE: $CLANG_SOURCE"; exit 1 ;;
+          esac
+          if [ "$(find ./clang -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ] \
+             && [ ! -d ./clang/bin ]; then
+            mv -f "$(find ./clang -mindepth 1 -maxdepth 1 -type d)"/* ./clang
+          fi
+          test -x ./clang/bin/clang || { echo "::error::clang not found after extraction"; exit 1; }
+          ./clang/bin/clang --version | head -n1
+
+      - name: Cache compiler objects
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ env.DEVICE }}-optimized-${{ hashFiles('build.env') }}
+          max-size: 2G
+
+      - name: Cache create_llvm_prof
+        id: autofdo-cache
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/autofdo
+          key: autofdo-${{ runner.os }}-${{ env.CREATE_LLVM_PROF_VERSION }}
+
+      - name: Download create_llvm_prof
+        if: steps.autofdo-cache.outputs.cache-hit != 'true'
+        run: |
+          set -Eeuo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace"
+          mkdir -p autofdo
+          url="https://github.com/google/autofdo/releases/download/${CREATE_LLVM_PROF_VERSION}/create_llvm_prof-x86_64-${CREATE_LLVM_PROF_VERSION}.zip"
+          wget -nv -O autofdo.zip "$url"
+          unzip -q -o autofdo.zip -d autofdo
+          rm -f autofdo.zip
+          bin="$(find autofdo -type f -name create_llvm_prof | head -n1)"
+          [ -n "$bin" ] || { echo "::error::create_llvm_prof not found in archive"; exit 1; }
+          chmod +x "$bin"
+          "$bin" --version 2>&1 | head -n5 || true
+
+      - name: Resolve AutoFDO profile
+        id: profile
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+          afdo=(profiles/devices/"$DEVICE"/*.afdo profiles/common/*.afdo)
+          perf=(profiles/devices/"$DEVICE"/perf-*.data profiles/common/perf-*.data)
+          if [ "${#afdo[@]}" -gt 0 ]; then
+            printf 'kind=afdo\npath=%s\n' "${afdo[0]}" >> "$GITHUB_OUTPUT"
+            echo "Using profile ${afdo[0]}"
+          elif [ "${#perf[@]}" -gt 0 ]; then
+            printf 'kind=perf\npath=%s\n' "${perf[0]}" >> "$GITHUB_OUTPUT"
+            echo "Will convert ${perf[0]}"
+          else
+            echo "kind=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore profiler build (for conversion)
+        if: steps.profile.outputs.kind == 'perf'
+        uses: actions/cache/restore@v4
+        with:
+          path: kernel_workspace/profiler-cache/${{ env.DEVICE }}
+          key: profiler-${{ env.DEVICE }}-${{ needs.prepare.outputs.profiler_key }}
+
+      - name: Convert perf.data to AutoFDO profile
+        id: convert
+        if: steps.profile.outputs.kind == 'perf'
+        run: |
+          set -Eeuo pipefail
+          vmlinux="kernel_workspace/profiler-cache/$DEVICE/vmlinux"
+          if [ ! -s "$vmlinux" ]; then
+            # The profiler job runs in parallel with this one. On a fresh run its
+            # cache entry does not exist until that job finishes.
+            echo "::warning::No cached profiler build for $DEVICE yet (profiler runs in parallel); skipping conversion."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### $DEVICE: conversion skipped"
+              echo
+              echo "\`perf.data\` needs the profiler \`vmlinux\`, which is not in the"
+              echo "cache yet. Re-run the workflow once the profiler job has saved it."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          bin="$(find kernel_workspace/autofdo -type f -name create_llvm_prof | head -n1)"
+          chmod +x "$bin"
+          mkdir -p profiles/resolved
+          "$bin" --binary="$vmlinux" \
+                 --profile="${{ steps.profile.outputs.path }}" \
+                 --profiler=perf_spe --format=extbinary \
+                 --out="profiles/resolved/${DEVICE}.afdo"
+          test -s "profiles/resolved/${DEVICE}.afdo"
+          echo "PROFILE=profiles/resolved/${DEVICE}.afdo" >> "$GITHUB_ENV"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Select profile
+        id: select
+        if: steps.profile.outputs.kind == 'afdo'
+        run: |
+          echo "PROFILE=${{ steps.profile.outputs.path }}" >> "$GITHUB_ENV"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: No profile available
+        if: steps.profile.outputs.kind == 'none'
+        run: |
+          echo "::warning::No .afdo or perf-*.data under profiles/ for $DEVICE — skipping the optimized build."
+          {
+            echo "### No AutoFDO profile for $DEVICE"
+            echo
+            echo "The profiler kernel was still built. Flash it, collect \`perf.data\`,"
+            echo "then commit the profile under \`profiles/devices/$DEVICE/\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build optimized kernel
+        if: |
+          steps.select.outputs.ready == 'true' || steps.convert.outputs.ready == 'true'
+        run: bash ./build.sh --stage optimized --device "$DEVICE" --profile "$PROFILE"
+
+      - name: Show optimized provenance
+        if: |
+          steps.select.outputs.ready == 'true' || steps.convert.outputs.ready == 'true'
+        run: |
+          cat kernel_workspace/dist/*optimized*.provenance || true
+          grep -E 'CONFIG_(LTO|THINLTO|AUTOFDO|ARM_SPE)' \
+            kernel_workspace/android-kernel/out/.config | sort || true
+
+      - name: Upload optimized kernel
+        if: |
+          steps.select.outputs.ready == 'true' || steps.convert.outputs.ready == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.DEVICE }}-autofdo-r${{ github.run_number }}
+          path: |
+            kernel_workspace/dist/*optimized*.zip
+            kernel_workspace/dist/*optimized*.provenance
+          if-no-files-found: error
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # 5. Publish
+  # -------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [generate-build-matrix, prepare, profiler, optimized]
+    if: |
+      !cancelled() &&
+      (needs.profiler.result == 'success' || needs.optimized.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -Eeuo pipefail
+          cd dist
+          find . -type f -name '*.zip' -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release tag
+        id: tag
+        run: |
+          echo "tag=kernel-r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "name=MT6768 AutoFDO r${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: false
+          body: |
+            Automated **AutoFDO** build for MT6768 (merlin / lancelot / selene).
+
+            - Kernel commit: `${{ needs.prepare.outputs.kernel_commit }}`
+            - Run: #${{ github.run_number }}
+            - Profiler cache key: `${{ needs.prepare.outputs.profiler_key }}`
+
+            ### Which file do I flash?
+            | Artifact | Purpose |
+            |---|---|
+            | `*-profiler-*.zip` | **Training kernel.** SPE + `kpti=off`, no LTO. Flash only to collect samples. Do not use daily. |
+            | `*-autofdo-*.zip` | **Production kernel.** ThinLTO + AutoFDO profile. This is the one to keep. |
+
+            > The profiler kernel is the only one that exposes `arm_spe_0`. If
+            > `ls /sys/bus/event_source/devices/` on the training kernel does not
+            > list it, the profile cannot be collected — see `docs/SPE-BRINGUP.md`.
+
+            Verify `SHA256SUMS` before flashing.
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
