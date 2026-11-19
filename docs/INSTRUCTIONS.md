@@ -80,10 +80,10 @@ apply them in this order on a clean tree.
 | 3 | [AutoFDO: Enable `-ffunction-sections` for the AutoFDO build](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/9b8063ef058698936de6127928bec65b2041cb74) | per-function sections when a profile is used |
 | 4 | [AutoFDO: Enable machine function split optimization](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/1cdcf552317906d40e925afe1e4698ae8155eacd) | hot/cold splitting (`-fsplit-machine-functions`) |
 | 5 | [AutoFDO: Add arm64 support](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/3e782ab7ec0b68df1dd0e92c9e0e995a0b6ae7bc) | `ARCH_SUPPORTS_AUTOFDO_CLANG` on arm64 |
-| 6 | [arch: Add helper Kconfig for arm64 spe profiler](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/df93e8faf59c131f76d8edf34ea9c9e450fa8bd8) | `CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE` → selects `ARM_SPE_PMU`, `PID_IN_CONTEXTIDR`, appends `kpti=off` |
-| 7 | [Add Propeller configuration for kernel build](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/27196668c7d2f01b392fe3f3af14b3324358f362) | `CONFIG_PROPELLER_CLANG`, `.llvm_bb_addr_map` |
-| 8 | [arch/arm64: Enable AUTOFDO_CLANG](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/912d94886e558405b1ccf92177f2bfd68634b511) | `CONFIG_AUTOFDO_CLANG=y` in the defconfig |
-| 9 | [CONFIG_PROPELLER_CLANG=y](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/a04295a3a7af06a3c9a82d60c2a1ae0d9324be25) | `CONFIG_PROPELLER_CLANG=y` in the defconfig |
+| 6 | [arch: Add helper Kconfig for arm64 spe profiler](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/63a85f77d12ebdd33c67d9c63edd26342e799f82) | `CONFIG_AUTOFDO_CLANG_PROFILER_ARM64_SPE` → selects `ARM_SPE_PMU`, `PID_IN_CONTEXTIDR`, appends `kpti=off` |
+| 7 | [Add Propeller configuration for kernel build](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/63a85f77d12ebdd33c67d9c63edd26342e799f82) | `CONFIG_PROPELLER_CLANG`, `.llvm_bb_addr_map` |
+| 8 | [arch/arm64: Enable AUTOFDO_CLANG](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/bedbd08bab07bf0c12695423711d1e3bd947f3fd) | `CONFIG_AUTOFDO_CLANG=y` in the defconfig |
+| 9 | [CONFIG_PROPELLER_CLANG=y](https://github.com/mt6768-S/android_kernel_xiaomi_mt6768/commit/0e882cae3bd21c071b3a4ea415c3ee7d4e212c39) | `CONFIG_PROPELLER_CLANG=y` in the defconfig |
 
 If you build from a different tree/branch, verify each patch is present before
 blaming the profile:

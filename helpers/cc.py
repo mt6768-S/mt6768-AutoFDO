@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-import argparse, pathlib, re, sys
+"""Update Linux kernel Kconfig values in an existing config."""
 
-CONFIG_PATH = pathlib.Path("out/.config")
+import argparse
+import pathlib
+import re
+import sys
 
-def main():
+CONFIG_LINE = re.compile(r"^(?:# )?(CONFIG_[A-Za-z0-9_]+)(?:=.*| is not set)\s*$")
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="Linux kernel .config editor")
+    parser.add_argument("--config", type=pathlib.Path, default=pathlib.Path("out/.config"))
     parser.add_argument("options", nargs="+", help="e.g. CONFIG_KSU=y")
     args = parser.parse_args()
 
@@ -19,15 +25,16 @@ def main():
             parser.error(f"Invalid config value: {value}")
         changes[key] = value
 
-    if not CONFIG_PATH.is_file():
-        print(f"Error: {CONFIG_PATH} does not exist"); sys.exit(1)
+    if not args.config.is_file():
+        print(f"Error: {args.config} does not exist", file=sys.stderr)
+        return 1
 
     try:
-        lines = CONFIG_PATH.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        lines = args.config.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         updated, found = [], set()
 
         for line in lines:
-            m = re.match(r"^(?:# )?(CONFIG_[A-Za-z0-9_]+)(?:=.*| is not set)\s*$", line.rstrip("\n"))
+            m = CONFIG_LINE.match(line.rstrip("\n"))
             if m and (key := m.group(1)) in changes:
                 updated.append(f"{key}={changes[key]}\n"); found.add(key)
             else:
@@ -37,14 +44,15 @@ def main():
             if key not in found:
                 updated.append(f"{key}={value}\n")
 
-        CONFIG_PATH.write_text("".join(updated), encoding="utf-8")
+        args.config.write_text("".join(updated), encoding="utf-8")
 
         for key, value in changes.items():
             print(f"  {key}={value}")
         print(f"\nUpdated {len(changes)} configuration option(s).")
 
     except OSError as e:
-        print(f"Error: {e}"); sys.exit(1)
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
